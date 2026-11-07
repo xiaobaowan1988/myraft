@@ -63,13 +63,14 @@ type detSim struct {
 	q    eventHeap
 	seq  uint64
 
-	nodes  []*Raft
+	nodes  []*core
 	stores []*MemStorage
 	up     []bool
 	epoch  []int // bumped on crash/restart; invalidates in-flight events
 	group  []int // nodes talk iff same group
 
 	drop, dup float64
+	crashRate float64 // per non-empty flush, at each of the two persistence-boundary crash points
 	maxDelay  time.Duration
 	longRate  float64
 	longDelay time.Duration
@@ -98,7 +99,7 @@ func newDetSim(seed int64, dump bool) *detSim {
 	s := &detSim{
 		seed: seed, rng: rand.New(rand.NewSource(seed)), n: n,
 		base:   time.Unix(1_700_000_000, 0),
-		nodes:  make([]*Raft, n),
+		nodes:  make([]*core, n),
 		stores: make([]*MemStorage, n),
 		up:     make([]bool, n), epoch: make([]int, n), group: make([]int, n),
 		h: fnv.New64a(), dumpAll: dump,
@@ -131,12 +132,11 @@ func (s *detSim) reach(a, b int) bool { return s.up[a] && s.up[b] && s.group[a] 
 func (s *detSim) boot(i int) {
 	s.epoch[i]++
 	ep := s.epoch[i]
-	r, err := newRaft(i, s.n, s.stores[i], s.seed*7919+int64(i)*131+int64(ep), func() time.Time { return s.base.Add(s.now) })
+	r, err := restoreCore(i, s.n, s.stores[i], s.seed*7919+int64(i)*131+int64(ep), func() time.Time { return s.base.Add(s.now) })
 	if err != nil {
 		s.fail("boot %d: %v", i, err)
 		return
 	}
-	r.out = &simOut{s: s, id: i}
 	s.nodes[i], s.up[i] = r, true
 	s.expectApply[i], s.seenCommit[i] = 1, 0
 	s.tickLoop(i, ep)
@@ -153,6 +153,9 @@ func (s *detSim) tickLoop(i, ep int) {
 			return
 		}
 		s.nodes[i].onTick()
+		if !s.flush(i) {
+			return
+		}
 		s.tickLoop(i, ep)
 	})
 }
@@ -172,7 +175,7 @@ func (s *detSim) delay() time.Duration {
 // the request arrives and returns the continuation to run on the source when
 // the reply arrives. Requests may be lost, delayed, reordered or duplicated;
 // so may replies.
-func (s *detSim) rpc(from, to int, name string, handle func(dst *Raft) func(src *Raft), canDup bool) {
+func (s *detSim) rpc(from, to int, name string, handle func(dst *core) func(src *core), canDup bool) {
 	fromEpoch := s.epoch[from]
 	if !s.reach(from, to) || s.rng.Float64() < s.drop {
 		return
@@ -185,6 +188,9 @@ func (s *detSim) rpc(from, to int, name string, handle func(dst *Raft) func(src 
 			return
 		}
 		onReply := handle(s.nodes[to])
+		if !s.flush(to) {
+			return // crashed at a persistence boundary: the reply never left
+		}
 		if s.rng.Float64() < s.drop {
 			return
 		}
@@ -193,6 +199,7 @@ func (s *detSim) rpc(from, to int, name string, handle func(dst *Raft) func(src 
 				return
 			}
 			onReply(s.nodes[from])
+			s.flush(from)
 		}
 		if canDup && s.rng.Float64() < s.dup {
 			s.after(s.delay(), fmt.Sprintf("%s rep(dup) %d->%d", name, to, from), deliverReply)
@@ -201,29 +208,57 @@ func (s *detSim) rpc(from, to int, name string, handle func(dst *Raft) func(src 
 	})
 }
 
-type simOut struct {
-	s  *detSim
-	id int
+// flush carries out node i's Ready in the same order as Raft.flush:
+// persist -> send -> apply. Crash points are injected at the two persistence
+// boundaries; it returns false if the node crashed (the rest of the Ready is
+// then lost, exactly like a real process death).
+func (s *detSim) flush(i int) bool {
+	c := s.nodes[i]
+	rd := c.takeReady()
+	if rd.empty() {
+		return true
+	}
+	if s.crashAt(i, "before persist") {
+		return false // nothing durable, nothing sent, no reply
+	}
+	if len(rd.Persist) > 0 {
+		if err := s.stores[i].Append(rd.Persist); err != nil {
+			s.fail("node %d persist: %v", i, err)
+		}
+	}
+	if s.crashAt(i, "after persist, before send") {
+		return false // durable, but requests/replies/apply never left
+	}
+	for _, v := range rd.Votes {
+		v := v
+		s.rpc(i, v.peer, "vote", func(dst *core) func(*core) {
+			reply := &RequestVoteReply{}
+			dst.handleRequestVote(v.args, reply)
+			return func(src *core) { src.onVoteReply(v.peer, v.args.Term, reply) }
+		}, true)
+	}
+	for _, a := range rd.Appends {
+		a := a
+		s.rpc(i, a.peer, "append", func(dst *core) func(*core) {
+			reply := &AppendEntriesReply{}
+			dst.handleAppendEntries(a.args, reply)
+			return func(src *core) { src.onAppendReply(a.peer, a.ni, a.args, reply) }
+		}, true)
+	}
+	s.onApply(i, rd.Apply)
+	return true
 }
 
-func (o *simOut) sendVote(peer int, args *RequestVoteArgs) {
-	o.s.rpc(o.id, peer, "vote", func(dst *Raft) func(*Raft) {
-		reply := &RequestVoteReply{}
-		dst.handleRequestVote(args, reply)
-		return func(src *Raft) { src.onVoteReply(peer, args.Term, reply) }
-	}, true)
+func (s *detSim) crashAt(i int, where string) bool {
+	if s.crashRate > 0 && s.up[i] && s.downCount() < 2 && s.rng.Float64() < s.crashRate {
+		s.crash(i)
+		s.trace1(fmt.Sprintf("FAULT crash %d %s", i, where))
+		return true
+	}
+	return false
 }
 
-func (o *simOut) sendAppend(peer, ni int, args *AppendEntriesArgs) {
-	o.s.rpc(o.id, peer, "append", func(dst *Raft) func(*Raft) {
-		reply := &AppendEntriesReply{}
-		dst.handleAppendEntries(args, reply)
-		return func(src *Raft) { src.onAppendReply(peer, ni, args, reply) }
-	}, true)
-}
-
-func (o *simOut) deliver(msgs []ApplyMsg) {
-	s, i := o.s, o.id
+func (s *detSim) onApply(i int, msgs []ApplyMsg) {
 	for _, m := range msgs {
 		if m.CommandIndex != s.expectApply[i] {
 			s.fail("node %d applied index %d, expected %d", i, m.CommandIndex, s.expectApply[i])
@@ -254,6 +289,7 @@ func (s *detSim) clientLoop(until time.Duration) {
 			if _, _, ok := s.nodes[i].propose(s.nextCmd); ok {
 				s.nextCmd++
 			}
+			s.flush(i)
 		}
 		s.clientLoop(until)
 	})
@@ -313,7 +349,7 @@ func (s *detSim) healAll() {
 	for i := range s.group {
 		s.group[i] = 0
 	}
-	s.drop, s.dup, s.maxDelay, s.longRate = 0, 0, 5*time.Millisecond, 0
+	s.drop, s.dup, s.maxDelay, s.longRate, s.crashRate = 0, 0, 5*time.Millisecond, 0, 0
 	for i := range s.up {
 		if !s.up[i] {
 			s.boot(i)
@@ -455,6 +491,7 @@ type simResult struct {
 func runSim(seed int64, dump bool) simResult {
 	s := newDetSim(seed, dump)
 	s.drop, s.dup, s.maxDelay, s.longRate, s.longDelay = 0.15, 0.05, 20*time.Millisecond, 0.05, 500*time.Millisecond
+	s.crashRate = 0.006
 	const chaosEnd, clientEnd, end = 12 * time.Second, 18 * time.Second, 21 * time.Second
 	s.clientLoop(clientEnd)
 	s.faultLoop(chaosEnd)

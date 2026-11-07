@@ -11,7 +11,8 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
 | 文件 | 内容 |
 |---|---|
 | `raft/types.go` | 状态枚举、`LogEntry`、`ApplyMsg`、RPC 参数/应答、`Transport` 接口 |
-| `raft/raft.go` | `Raft` 结构体、事件循环、选举、日志复制、commit 推进、applyPump |
+| `raft/core.go` | **纯状态机 `core`**：选举、日志复制、commit 推进；不做任何 IO，输出累积在 `Ready` 里 |
+| `raft/raft.go` | **IO 外壳 `Raft`**：事件循环、`flush`（先落盘再发送/回复/apply）、applyPump、对外 API |
 | `raft/wal.go` | `Storage` 接口、`MemStorage`、`FileWAL`（追加写 + fsync + CRC） |
 | `raft/simnet.go` | 进程内模拟网络：丢包、延迟、分区、节点宕机 |
 | `raft/*_test.go` | 选举/复制/分区/持久化/混沌测试、WAL 单测 |
@@ -23,14 +24,14 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
   RPC 到达（处理器投递闭包并等待结果）、`Start()`/`State()`、定时 tick、RPC 应答。
   铁律：① 状态只在循环协程里读写；② 循环内**不做**网络调用，也不向自己投递并等待（否则死锁），
   发 RPC 由临时协程完成，应答再以事件投递回来；③ 应答事件处理时仍需校验 `term`/`state` 防止过期应答；
-  ④ WAL 写入在循环内同步完成（fsync 期间循环阻塞，换取"先持久化再回复"的简单性）。
+  ④ 状态机本身不写盘（见阶段 8）：写盘由外壳在每个事件处理后统一完成。
 - [x] **2. 选举引擎**：后台 ticker 驱动；随机选举超时 150–300ms；心跳 50ms；
   当选 Leader 后追加一条 no-op 日志，以便提交前任期遗留的日志。
 - [x] **3. RPC 层**：`RequestVote` / `AppendEntries`，严格 term 校验、prevLog 一致性检查，
   冲突时返回 `ConflictIndex/ConflictTerm` 让 Leader 快速回退 `nextIndex`；
   只在**真正冲突**时截断日志（避免乱序/重复 RPC 误删已匹配日志）。
 - [x] **4. WAL 持久化**：追加记录 `meta(term,votedFor)` 与 `append(index, entries)`，
-  每条记录 `长度 + CRC32 + gob 载荷`，`Sync()` 成功后才回复 RPC；
+  每条记录 `长度 + CRC32 + gob 载荷`，`Sync()` 成功后才发送消息/回复 RPC/交付 apply；
   加载时丢弃末尾撕裂/损坏的记录并截断文件。
 - [x] **5. Apply 通道**：循环协程把新提交的日志交给 `applyPump` 协程（无锁的无界队列：
   `select` 同时收批次、发 `applyCh`），保证上层处理慢时不会阻塞事件循环。
@@ -38,9 +39,8 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
   断言：任意 index 上各节点 apply 的命令一致、已确认提交的命令不丢、恢复网络后系统可继续提交。
 
 - [x] **7. 确定性回放测试（`raft/detsim_test.go`）**：
-  - 重构：Raft 状态机不再直接调用 `time.Now` 和起 goroutine 发 RPC，改为经 `r.now()` 和 `outbox` 接口
-    （`sendVote` / `sendAppend` / `deliver`）与外界交互；真实外壳 `shellOut` 用 goroutine 实现，
-    测试里的 `simOut` 把消息变成虚拟时钟上的事件。新增 `newRaft`（不起 goroutine）与 `propose`。
+  - 重构：Raft 状态机不再直接调用 `time.Now` 和起 goroutine 发 RPC，只经 `now()` 与外界交互，
+    输出放进 `Ready`（阶段 8）；真实外壳用 goroutine 发送，模拟器把消息变成虚拟时钟上的事件。
   - 模拟器：单线程、虚拟时钟、`(时间, 序号)` 排序的事件堆；网络丢包/重复/延迟/乱序、分区、宕机重启、
     客户端提案全部由**一个种子**的 `math/rand` 决定，模拟器代码里不遍历 map，保证可复现。
   - 每个事件后检查不变量：同 term 至多一个 Leader、term 不回退、commitIndex 不回退且不越界、
@@ -57,7 +57,24 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
     （新 Leader 先追加 no-op、且总是把日志发到末尾），单独注入检不出；同时去掉 no-op 后，
     前者在 5000 个种子中仅 1 个触发（图 8 场景很稀有）——说明随机模拟不能保证抓到所有稀有交错。
   - 回放验证：同一种子跑两遍，事件轨迹哈希必须相同；失败时打印种子与最近事件，
-    用 `go test ./raft -run TestDeterministicReplay -seed=N -trace` 精确复现。
+    用 `go test ./raft -run TestDeterministicReplay -args -seed=N -trace` 精确复现。
+
+- [x] **8. 写盘移出核心（参考 etcd/raft 的 Ready 模式）**：
+  - 拆分为两个类型：`core`（纯状态机，不持有 `Storage`、channel、`time.Now`、goroutine）与 `Raft`（外壳）。
+    `core` 每处理一个事件，把待办累积到 `Ready{Persist, Votes, Appends, Apply}`；
+    `core` 由已恢复的状态（term/votedFor/log）构造，**不接触 `Storage`**。
+  - 外壳 `flush()` 的固定顺序：① `Storage.Append(Persist)`（fsync 成功）→ ② 发 RPC 请求 → ③ 交付 apply →
+    ④ 放行等待中的 RPC 应答。因此"先持久化再对外可见"由外壳**统一保证**，而不是散落在每个处理函数里；
+    一个事件内的多条记录合并为一次 `Append`（一次 fsync）。
+  - 模拟器同样按此顺序驱动，并新增两类故障：**落盘前崩溃**（丢弃未落盘的 Ready，不发消息/不回复）与
+    **落盘后、发送前崩溃**（记录已落盘但消息/应答丢失），以验证持久化边界上的安全性。
+  - 约束测试：`TestCoreHasNoIO` 扫描 `core.go`，禁止出现 `Storage`、`chan`、`go `、`sync.`、`time.Now`、`os.` 等。
+  - 存储约束：同一份存储同一时刻只能被一个 `Raft` 实例使用（`Kill()` 等待循环退出保证旧实例不再写入）。
+  - 验证结果：崩溃概率 0.6%（每次非空 flush、每个崩溃点），2000 个种子全部通过。变异验证：
+    "先回复、后落盘"（回复不依赖发送方是否已崩溃）被稳定检出（1000 种子中 34 个失败，含"已提交条目丢失"）。
+    **未检出**：只漏掉"投票后 votedFor 落盘"这一处（15000 个种子无失败）——需要某节点投票、回复送达后崩溃、
+    重启后又投给同任期的另一候选人且两人都凑够多数，组合太稀有，属于已知检测盲区。
+    教训：写变异时要确认它真的改变了行为（本阶段有两个变异因模拟器的可达性/返回值逻辑而是空操作）。
 
 ## 与原指南的有意偏差（原因）
 
@@ -65,8 +82,8 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
    否则有竞态；deadline 方案更简单且不丢事件。
 2. **选举超时在每次 `electionTimer.C` 触发时无条件重置的写法不采用**：只在
    收到合法 Leader 的 AppendEntries、投出选票、发起新选举、Leader 因应答中的更高 term 而退位时重置。
-3. **并发模型改为事件循环（原指南为大锁）**：按用户要求；不再有 `sync.Mutex`，`Kill()` 通过关闭 `done`
-   并等待循环退出来保证之后不再写盘。Applier 用 pump 协程而不是 `Sleep(10ms)` 轮询。
+3. **并发模型改为事件循环（原指南为大锁）**：按用户要求；Raft 核心不再有 `sync.Mutex`，`Kill()` 通过关闭
+   `done` 并等待循环退出来保证之后不再写盘。Applier 用 pump 协程而不是 `Sleep(10ms)` 轮询。
 4. **传输层抽象为 `Transport` 接口（带类型的两个方法），不直接依赖 `net/rpc`**：
    便于模拟网络注入故障；`net/rpc` 适配器列为后续工作，不在本次范围。
 5. **`Command` 仍为 `interface{}`**：WAL 用 gob，自定义类型需 `gob.Register`；

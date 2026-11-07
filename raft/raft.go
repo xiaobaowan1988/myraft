@@ -27,8 +27,13 @@ var (
 type Raft struct {
 	me int
 	n  int
-	tr Transport
 	st Storage
+
+	// now is the only clock the state machine reads; out is the only way it
+	// talks to the outside. Both are swapped for virtual ones in the
+	// deterministic simulator (detsim_test.go).
+	now func() time.Time
+	out outbox
 
 	events    chan func()
 	applyFeed chan []ApplyMsg
@@ -53,13 +58,23 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
+	granted          []bool // granted[p]: peer p voted for us in the current election (dedups duplicate replies)
 	electionDeadline time.Time
 	lastBroadcast    time.Time
 	rng              *rand.Rand
 }
 
-// Make starts node me of an n-node cluster, restoring state from st.
-func Make(me, n int, tr Transport, st Storage, applyCh chan ApplyMsg) (*Raft, error) {
+// outbox is how the state machine sends messages and delivers committed
+// entries. All methods are called from the event loop and must not block.
+type outbox interface {
+	sendVote(peer int, args *RequestVoteArgs)
+	sendAppend(peer, ni int, args *AppendEntriesArgs)
+	deliver(msgs []ApplyMsg)
+}
+
+// newRaft builds the state machine, restoring state from st. It starts no
+// goroutines and sets no outbox; the caller wires those up.
+func newRaft(me, n int, st Storage, seed int64, now func() time.Time) (*Raft, error) {
 	recs, err := st.Load()
 	if err != nil {
 		return nil, err
@@ -69,19 +84,64 @@ func Make(me, n int, tr Transport, st Storage, applyCh chan ApplyMsg) (*Raft, er
 		return nil, err
 	}
 	r := &Raft{
-		me: me, n: n, tr: tr, st: st, applyCh: applyCh,
-		events:      make(chan func()), // unbuffered: a successful post means the loop took it and will run it
-		applyFeed:   make(chan []ApplyMsg, 16),
-		done:        make(chan struct{}),
-		stopped:     make(chan struct{}),
+		me: me, n: n, st: st, now: now,
 		currentTerm: term, votedFor: votedFor, log: log,
 		state: Follower,
-		rng:   rand.New(rand.NewSource(time.Now().UnixNano() + int64(me)*7919)),
+		rng:   rand.New(rand.NewSource(seed)),
 	}
 	r.resetElection()
+	return r, nil
+}
+
+// Make starts node me of an n-node cluster, restoring state from st.
+func Make(me, n int, tr Transport, st Storage, applyCh chan ApplyMsg) (*Raft, error) {
+	r, err := newRaft(me, n, st, time.Now().UnixNano()+int64(me)*7919, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	r.applyCh = applyCh
+	r.events = make(chan func()) // unbuffered: a successful post means the loop took it and will run it
+	r.applyFeed = make(chan []ApplyMsg, 16)
+	r.done = make(chan struct{})
+	r.stopped = make(chan struct{})
+	r.out = &shellOut{r: r, tr: tr}
 	go r.run()
 	go r.applyPump()
 	return r, nil
+}
+
+// shellOut is the production outbox: RPCs go out from helper goroutines and
+// replies are posted back to the event loop.
+type shellOut struct {
+	r  *Raft
+	tr Transport
+}
+
+func (o *shellOut) sendVote(peer int, args *RequestVoteArgs) {
+	go func() {
+		reply, ok := o.tr.RequestVote(peer, args)
+		if !ok {
+			return
+		}
+		o.r.post(func() { o.r.onVoteReply(peer, args.Term, reply) })
+	}()
+}
+
+func (o *shellOut) sendAppend(peer, ni int, args *AppendEntriesArgs) {
+	go func() {
+		reply, ok := o.tr.AppendEntries(peer, args)
+		if !ok {
+			return
+		}
+		o.r.post(func() { o.r.onAppendReply(peer, ni, args, reply) })
+	}()
+}
+
+func (o *shellOut) deliver(msgs []ApplyMsg) {
+	select {
+	case o.r.applyFeed <- msgs: // applyPump always drains promptly, so this does not stall the loop
+	case <-o.r.done:
+	}
 }
 
 // Kill stops the node and waits for the event loop to exit, so after Kill
@@ -122,18 +182,23 @@ func (r *Raft) Start(cmd interface{}) (index, term int, isLeader bool) {
 	index, term = -1, -1
 	resp := make(chan struct{})
 	if cmd == nil || !r.post(func() {
-		defer close(resp)
-		if r.state != Leader {
-			return
-		}
-		r.appendLocal(LogEntry{Term: r.currentTerm, Command: cmd})
-		index, term, isLeader = len(r.log)-1, r.currentTerm, true
-		r.broadcast()
+		index, term, isLeader = r.propose(cmd)
+		close(resp)
 	}) {
 		return -1, -1, false
 	}
 	<-resp
 	return index, term, isLeader
+}
+
+// propose appends cmd if this node is leader (loop only).
+func (r *Raft) propose(cmd interface{}) (index, term int, ok bool) {
+	if r.state != Leader {
+		return -1, -1, false
+	}
+	r.appendLocal(LogEntry{Term: r.currentTerm, Command: cmd})
+	r.broadcast()
+	return len(r.log) - 1, r.currentTerm, true
 }
 
 // RequestVote is the RPC entry point; it runs the handler on the event loop.
@@ -178,10 +243,10 @@ func (r *Raft) run() {
 
 func (r *Raft) onTick() {
 	if r.state == Leader {
-		if time.Since(r.lastBroadcast) >= HeartbeatInterval {
+		if r.now().Sub(r.lastBroadcast) >= HeartbeatInterval {
 			r.broadcast()
 		}
-	} else if time.Now().After(r.electionDeadline) {
+	} else if r.now().After(r.electionDeadline) {
 		r.startElection()
 	}
 }
@@ -201,7 +266,7 @@ func (r *Raft) persistMeta() {
 
 func (r *Raft) resetElection() {
 	span := ElectionTimeoutMax - ElectionTimeoutMin
-	r.electionDeadline = time.Now().Add(ElectionTimeoutMin + time.Duration(r.rng.Int63n(int64(span))))
+	r.electionDeadline = r.now().Add(ElectionTimeoutMin + time.Duration(r.rng.Int63n(int64(span))))
 }
 
 // becomeFollower steps down; a higher term clears the vote and is persisted.
@@ -268,10 +333,7 @@ func (r *Raft) setCommit(idx int) {
 		e := r.log[r.lastApplied]
 		msgs = append(msgs, ApplyMsg{CommandValid: e.Command != nil, Command: e.Command, CommandIndex: r.lastApplied})
 	}
-	select {
-	case r.applyFeed <- msgs: // pump always drains promptly, so this does not stall the loop
-	case <-r.done:
-	}
+	r.out.deliver(msgs)
 }
 
 // applyPump is an unbounded, lock-free queue between the event loop and the
@@ -310,32 +372,34 @@ func (r *Raft) startElection() {
 	}
 	lastIdx := len(r.log) - 1
 	args := &RequestVoteArgs{Term: term, CandidateID: r.me, LastLogIndex: lastIdx, LastLogTerm: r.log[lastIdx].Term}
-	votes := 1 // only touched by loop closures
+	r.granted = make([]bool, r.n)
+	r.granted[r.me] = true
 	for peer := 0; peer < r.n; peer++ {
-		if peer == r.me {
-			continue
+		if peer != r.me {
+			r.out.sendVote(peer, args)
 		}
-		go func(peer int) {
-			reply, ok := r.tr.RequestVote(peer, args)
-			if !ok {
-				return
+	}
+}
+
+func (r *Raft) onVoteReply(peer, term int, reply *RequestVoteReply) {
+	if reply.Term > r.currentTerm {
+		r.becomeFollower(reply.Term)
+		return
+	}
+	if r.state != Candidate || r.currentTerm != term {
+		return // stale reply
+	}
+	if reply.VoteGranted && !r.granted[peer] {
+		r.granted[peer] = true
+		votes := 0
+		for _, g := range r.granted {
+			if g {
+				votes++
 			}
-			r.post(func() {
-				if reply.Term > r.currentTerm {
-					r.becomeFollower(reply.Term)
-					return
-				}
-				if r.state != Candidate || r.currentTerm != term {
-					return // stale reply
-				}
-				if reply.VoteGranted {
-					votes++
-					if votes > r.n/2 {
-						r.becomeLeader()
-					}
-				}
-			})
-		}(peer)
+		}
+		if votes > r.n/2 {
+			r.becomeLeader()
+		}
 	}
 }
 
@@ -362,7 +426,7 @@ func (r *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 // ---- replication ----
 
 func (r *Raft) broadcast() {
-	r.lastBroadcast = time.Now()
+	r.lastBroadcast = r.now()
 	for peer := 0; peer < r.n; peer++ {
 		if peer != r.me {
 			r.replicate(peer)
@@ -370,8 +434,8 @@ func (r *Raft) broadcast() {
 	}
 }
 
-// replicate builds the request on the loop, sends it from a helper goroutine,
-// and processes the reply back on the loop.
+// replicate builds the request on the loop and hands it to the outbox; the
+// reply comes back through onAppendReply, also on the loop.
 func (r *Raft) replicate(peer int) {
 	if r.state != Leader {
 		return
@@ -390,13 +454,7 @@ func (r *Raft) replicate(peer int) {
 		Entries:      append([]LogEntry(nil), r.log[ni:]...),
 		LeaderCommit: r.commitIndex,
 	}
-	go func() {
-		reply, ok := r.tr.AppendEntries(peer, args)
-		if !ok {
-			return
-		}
-		r.post(func() { r.onAppendReply(peer, ni, args, reply) })
-	}()
+	r.out.sendAppend(peer, ni, args)
 }
 
 func (r *Raft) onAppendReply(peer, ni int, args *AppendEntriesArgs, reply *AppendEntriesReply) {

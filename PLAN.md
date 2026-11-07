@@ -37,6 +37,28 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
 - [x] **6. 混沌测试**：5 节点进程内集群；丢包 15%、随机延迟、随机 2|3 分区、随机宕机/重启；
   断言：任意 index 上各节点 apply 的命令一致、已确认提交的命令不丢、恢复网络后系统可继续提交。
 
+- [x] **7. 确定性回放测试（`raft/detsim_test.go`）**：
+  - 重构：Raft 状态机不再直接调用 `time.Now` 和起 goroutine 发 RPC，改为经 `r.now()` 和 `outbox` 接口
+    （`sendVote` / `sendAppend` / `deliver`）与外界交互；真实外壳 `shellOut` 用 goroutine 实现，
+    测试里的 `simOut` 把消息变成虚拟时钟上的事件。新增 `newRaft`（不起 goroutine）与 `propose`。
+  - 模拟器：单线程、虚拟时钟、`(时间, 序号)` 排序的事件堆；网络丢包/重复/延迟/乱序、分区、宕机重启、
+    客户端提案全部由**一个种子**的 `math/rand` 决定，模拟器代码里不遍历 map，保证可复现。
+  - 每个事件后检查不变量：同 term 至多一个 Leader、term 不回退、commitIndex 不回退且不越界、
+    已提交条目全局唯一（状态机安全）、Leader 完整性（任一 Leader 含全部已提交条目）、apply 序号连续；
+    定期检查日志匹配性（Log Matching）。
+  - 场景：12s 混沌（15% 丢包、5% 重复、随机延迟、分区、宕机）→ 恢复网络 → 要求收敛、唯一 Leader、
+    各节点 commitIndex 与 apply 序列一致。
+  - 阶段 7 发现并修复的真实 bug：RequestVote 的应答被网络**重复投递**时，选票计数器会把同一节点的
+    同意票数两次，导致没拿到多数票就当选（原混沌测试没有"重复"故障，一直没暴露）。
+    现改为 `granted[]` 按 peer 去重。
+  - 变异验证（故意注入错误，确认模拟器能抓到；这些改动均未保留）：不持久化 term/投票、投票不比较日志新旧、
+    AppendEntries 无条件截断、重复投票重复计数——均被检出。
+    "旧任期条目直接按多数提交"与"follower 提交时不取 min(LeaderCommit, lastNew)"在当前实现下是**等价变异**
+    （新 Leader 先追加 no-op、且总是把日志发到末尾），单独注入检不出；同时去掉 no-op 后，
+    前者在 5000 个种子中仅 1 个触发（图 8 场景很稀有）——说明随机模拟不能保证抓到所有稀有交错。
+  - 回放验证：同一种子跑两遍，事件轨迹哈希必须相同；失败时打印种子与最近事件，
+    用 `go test ./raft -run TestDeterministicReplay -seed=N -trace` 精确复现。
+
 ## 与原指南的有意偏差（原因）
 
 1. **Ticker 用 10ms 轮询 + deadline，而不是 `time.Timer` 通道**：`Timer.Reset` 需要先 drain 通道，
@@ -57,3 +79,7 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
 ## 验证方式
 
 `go vet ./... && go test -race ./...`
+
+确定性模拟的种子扫描（注意自定义参数要放在 `-args` 之后）：
+`go test ./raft -run TestDeterministicReplay -args -seeds=2000`；复现单个种子：
+`go test ./raft -run TestDeterministicReplay -args -seed=N -trace`

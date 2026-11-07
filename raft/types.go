@@ -1,6 +1,8 @@
 // Package raft is a from-scratch implementation of the Raft consensus protocol.
 package raft
 
+import "context"
+
 // Node roles.
 const (
 	Follower = iota
@@ -53,10 +55,12 @@ type AppendEntriesReply struct {
 	ConflictTerm  int
 }
 
-// Transport sends RPCs to peers. ok == false means the call was lost or timed out.
+// Transport sends RPCs to peers. ok == false means the call was lost or timed
+// out. Implementations MUST return promptly once ctx is done: the caller relies
+// on that to bound the number of goroutines blocked in RPCs.
 type Transport interface {
-	RequestVote(to int, args *RequestVoteArgs) (reply *RequestVoteReply, ok bool)
-	AppendEntries(to int, args *AppendEntriesArgs) (reply *AppendEntriesReply, ok bool)
+	RequestVote(ctx context.Context, to int, args *RequestVoteArgs) (reply *RequestVoteReply, ok bool)
+	AppendEntries(ctx context.Context, to int, args *AppendEntriesArgs) (reply *AppendEntriesReply, ok bool)
 }
 
 // Handler is the server side of the RPCs; *Raft implements it.

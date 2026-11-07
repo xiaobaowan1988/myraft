@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -12,6 +13,11 @@ var (
 	ElectionTimeoutMin = 150 * time.Millisecond
 	ElectionTimeoutMax = 300 * time.Millisecond
 	tickInterval       = 10 * time.Millisecond
+
+	// RPCTimeout bounds every outgoing RPC, and so bounds the goroutines blocked
+	// in them. Keep RPCTimeout + HeartbeatInterval < ElectionTimeoutMin, or one
+	// lost heartbeat can let a follower time out.
+	RPCTimeout = 80 * time.Millisecond
 )
 
 // Raft is the I/O shell around the pure state machine (core). One goroutine,
@@ -190,7 +196,7 @@ func (r *Raft) flush() {
 		r.sendVote(v.peer, v.args)
 	}
 	for _, a := range rd.Appends {
-		r.sendAppend(a.peer, a.ni, a.args)
+		r.sendAppend(a.peer, a.ni, a.seq, a.args)
 	}
 	if len(rd.Apply) > 0 {
 		select {
@@ -208,7 +214,9 @@ func (r *Raft) flush() {
 // on the network) and post the reply back as an event.
 func (r *Raft) sendVote(peer int, args *RequestVoteArgs) {
 	go func() {
-		reply, ok := r.tr.RequestVote(peer, args)
+		ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
+		defer cancel()
+		reply, ok := r.tr.RequestVote(ctx, peer, args)
 		if !ok {
 			return
 		}
@@ -216,13 +224,17 @@ func (r *Raft) sendVote(peer int, args *RequestVoteArgs) {
 	}()
 }
 
-func (r *Raft) sendAppend(peer, ni int, args *AppendEntriesArgs) {
+func (r *Raft) sendAppend(peer, ni int, seq uint64, args *AppendEntriesArgs) {
 	go func() {
-		reply, ok := r.tr.AppendEntries(peer, args)
+		ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
+		defer cancel()
+		reply, ok := r.tr.AppendEntries(ctx, peer, args)
 		if !ok {
+			// Free the in-flight slot so the next heartbeat can retry.
+			r.post(func() { r.c.onAppendLost(peer, seq) })
 			return
 		}
-		r.post(func() { r.c.onAppendReply(peer, ni, args, reply) })
+		r.post(func() { r.c.onAppendReply(peer, ni, seq, args, reply) })
 	}()
 }
 

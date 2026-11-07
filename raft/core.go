@@ -39,6 +39,13 @@ type core struct {
 	nextIndex  []int
 	matchIndex []int
 
+	// At most one AppendEntries per follower is outstanding. inflight[p] is
+	// cleared by that request's reply or by its loss/timeout event; seq ties a
+	// release to the request it belongs to so stale events cannot free a newer one.
+	inflight    []bool
+	inflightSeq []uint64
+	seq         uint64
+
 	granted          []bool // granted[p]: peer p voted for us in the current election (dedups duplicate replies)
 	electionDeadline time.Time
 	lastBroadcast    time.Time
@@ -53,6 +60,7 @@ type voteOut struct {
 
 type appendOut struct {
 	peer, ni int
+	seq      uint64
 	args     *AppendEntriesArgs
 }
 
@@ -127,6 +135,8 @@ func (c *core) becomeLeader() {
 	c.state = Leader
 	c.nextIndex = make([]int, c.n)
 	c.matchIndex = make([]int, c.n)
+	c.inflight = make([]bool, c.n)
+	c.inflightSeq = make([]uint64, c.n)
 	for i := range c.nextIndex {
 		c.nextIndex[i] = len(c.log)
 	}
@@ -265,11 +275,14 @@ func (c *core) broadcast() {
 	}
 }
 
-// replicate queues one AppendEntries request for peer.
+// replicate queues one AppendEntries request for peer, unless one is already
+// outstanding (this bounds in-flight work per follower; heartbeats included).
 func (c *core) replicate(peer int) {
-	if c.state != Leader {
+	if c.state != Leader || c.inflight[peer] {
 		return
 	}
+	c.seq++
+	c.inflight[peer], c.inflightSeq[peer] = true, c.seq
 	ni := c.nextIndex[peer]
 	if ni < 1 {
 		ni = 1
@@ -284,10 +297,20 @@ func (c *core) replicate(peer int) {
 		Entries:      append([]LogEntry(nil), c.log[ni:]...),
 		LeaderCommit: c.commitIndex,
 	}
-	c.rd.Appends = append(c.rd.Appends, appendOut{peer, ni, args})
+	c.rd.Appends = append(c.rd.Appends, appendOut{peer, ni, c.seq, args})
 }
 
-func (c *core) onAppendReply(peer, ni int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+// release frees peer's in-flight slot if seq is still the current request.
+func (c *core) release(peer int, seq uint64) {
+	if c.state == Leader && c.inflight[peer] && c.inflightSeq[peer] == seq {
+		c.inflight[peer] = false
+	}
+}
+
+// onAppendLost handles a timed-out or lost AppendEntries; the next heartbeat retries.
+func (c *core) onAppendLost(peer int, seq uint64) { c.release(peer, seq) }
+
+func (c *core) onAppendReply(peer, ni int, seq uint64, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if reply.Term > c.currentTerm {
 		c.becomeFollower(reply.Term)
 		c.resetElection()
@@ -296,6 +319,7 @@ func (c *core) onAppendReply(peer, ni int, args *AppendEntriesArgs, reply *Appen
 	if c.state != Leader || c.currentTerm != args.Term {
 		return // stale reply
 	}
+	c.release(peer, seq)
 	prev := args.PrevLogIndex
 	if reply.Success {
 		match := prev + len(args.Entries)
@@ -306,6 +330,9 @@ func (c *core) onAppendReply(peer, ni int, args *AppendEntriesArgs, reply *Appen
 			c.nextIndex[peer] = c.matchIndex[peer] + 1
 		}
 		c.advanceCommit()
+		if c.nextIndex[peer] < len(c.log) {
+			c.replicate(peer) // more entries pending: keep the pipe busy
+		}
 		return
 	}
 	if c.nextIndex[peer] != ni {

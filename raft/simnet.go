@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"math/rand"
 	"sync"
 	"time"
@@ -93,7 +94,8 @@ func (s *SimNet) pass(a, b int) bool {
 	return s.reachableLocked(a, b) && s.rng.Float64() >= s.drop
 }
 
-func (s *SimNet) delay() {
+// delay sleeps for a random time; it returns false if ctx ended first.
+func (s *SimNet) delay(ctx context.Context) bool {
 	s.mu.Lock()
 	var d time.Duration
 	if s.maxDelay > 0 {
@@ -103,8 +105,16 @@ func (s *SimNet) delay() {
 		d += time.Duration(s.rng.Int63n(int64(s.longDelay) + 1))
 	}
 	s.mu.Unlock()
-	if d > 0 {
-		time.Sleep(d)
+	if d <= 0 {
+		return true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -116,11 +126,13 @@ func (s *SimNet) handler(a, b int) (Handler, bool) {
 }
 
 // roundTrip models request travel, remote handling, and reply travel.
-func (s *SimNet) roundTrip(from, to int, call func(Handler) interface{}) (interface{}, bool) {
+func (s *SimNet) roundTrip(ctx context.Context, from, to int, call func(Handler) interface{}) (interface{}, bool) {
 	if !s.pass(from, to) {
 		return nil, false
 	}
-	s.delay()
+	if !s.delay(ctx) {
+		return nil, false
+	}
 	h, ok := s.handler(from, to)
 	if !ok {
 		return nil, false
@@ -129,7 +141,9 @@ func (s *SimNet) roundTrip(from, to int, call func(Handler) interface{}) (interf
 	if !s.pass(to, from) {
 		return nil, false
 	}
-	s.delay()
+	if !s.delay(ctx) {
+		return nil, false
+	}
 	s.mu.Lock()
 	ok = s.reachableLocked(to, from)
 	s.mu.Unlock()
@@ -141,8 +155,8 @@ type endpoint struct {
 	from int
 }
 
-func (e *endpoint) RequestVote(to int, args *RequestVoteArgs) (*RequestVoteReply, bool) {
-	res, ok := e.s.roundTrip(e.from, to, func(h Handler) interface{} {
+func (e *endpoint) RequestVote(ctx context.Context, to int, args *RequestVoteArgs) (*RequestVoteReply, bool) {
+	res, ok := e.s.roundTrip(ctx, e.from, to, func(h Handler) interface{} {
 		a := *args
 		return h.RequestVote(&a)
 	})
@@ -152,8 +166,8 @@ func (e *endpoint) RequestVote(to int, args *RequestVoteArgs) (*RequestVoteReply
 	return res.(*RequestVoteReply), true
 }
 
-func (e *endpoint) AppendEntries(to int, args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
-	res, ok := e.s.roundTrip(e.from, to, func(h Handler) interface{} {
+func (e *endpoint) AppendEntries(ctx context.Context, to int, args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
+	res, ok := e.s.roundTrip(ctx, e.from, to, func(h Handler) interface{} {
 		a := *args
 		a.Entries = append([]LogEntry(nil), args.Entries...)
 		return h.AppendEntries(&a)

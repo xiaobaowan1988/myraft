@@ -92,6 +92,8 @@ type detSim struct {
 	appliedAny  map[int]interface{}
 	expectApply []int
 	nextCmd     int
+	slotAt      [][]time.Duration // [leader][peer]: when the current in-flight AppendEntries was sent
+	slotSeq     [][]uint64
 }
 
 func newDetSim(seed int64, dump bool) *detSim {
@@ -106,8 +108,10 @@ func newDetSim(seed int64, dump bool) *detSim {
 		leaderOf: map[int]int{}, seenCommit: make([]int, n), maxTerm: make([]int, n),
 		applied: make([]map[int]interface{}, n), appliedAny: map[int]interface{}{},
 		expectApply: make([]int, n), nextCmd: 1000,
+		slotAt: make([][]time.Duration, n), slotSeq: make([][]uint64, n),
 	}
 	for i := 0; i < n; i++ {
+		s.slotAt[i], s.slotSeq[i] = make([]time.Duration, n), make([]uint64, n)
 		s.stores[i] = &MemStorage{}
 		s.applied[i] = map[int]interface{}{}
 		s.boot(i)
@@ -174,14 +178,27 @@ func (s *detSim) delay() time.Duration {
 // rpc models one request/reply exchange. handle runs on the destination when
 // the request arrives and returns the continuation to run on the source when
 // the reply arrives. Requests may be lost, delayed, reordered or duplicated;
-// so may replies.
-func (s *detSim) rpc(from, to int, name string, handle func(dst *core) func(src *core), canDup bool) {
+// so may replies. Like the real shell, the caller gives up after RPCTimeout: a
+// reply that arrives later is discarded (the request itself may still be
+// processed by the destination). If onLost is non-nil it fires at the timeout,
+// mirroring Raft.sendAppend's loss event.
+func (s *detSim) rpc(from, to int, name string, handle func(dst *core) func(src *core), onLost func(src *core), canDup bool) {
 	fromEpoch := s.epoch[from]
+	deadline := s.now + RPCTimeout
+	if onLost != nil {
+		s.after(RPCTimeout, fmt.Sprintf("%s timeout %d->%d", name, from, to), func() {
+			if s.epoch[from] != fromEpoch || !s.up[from] {
+				return
+			}
+			onLost(s.nodes[from])
+			s.flush(from)
+		})
+	}
 	if !s.reach(from, to) || s.rng.Float64() < s.drop {
 		return
 	}
 	if canDup && s.rng.Float64() < s.dup {
-		s.rpc(from, to, name, handle, false) // a second copy of the same request
+		s.rpc(from, to, name, handle, nil, false) // a second copy of the same request
 	}
 	s.after(s.delay(), fmt.Sprintf("%s req %d->%d", name, from, to), func() {
 		if !s.reach(from, to) {
@@ -195,8 +212,8 @@ func (s *detSim) rpc(from, to int, name string, handle func(dst *core) func(src 
 			return
 		}
 		deliverReply := func() {
-			if s.epoch[from] != fromEpoch || !s.reach(to, from) {
-				return
+			if s.now > deadline || s.epoch[from] != fromEpoch || !s.reach(to, from) {
+				return // caller already gave up, or crashed, or unreachable
 			}
 			onReply(s.nodes[from])
 			s.flush(from)
@@ -235,15 +252,16 @@ func (s *detSim) flush(i int) bool {
 			reply := &RequestVoteReply{}
 			dst.handleRequestVote(v.args, reply)
 			return func(src *core) { src.onVoteReply(v.peer, v.args.Term, reply) }
-		}, true)
+		}, nil, true)
 	}
 	for _, a := range rd.Appends {
 		a := a
+		s.slotAt[i][a.peer], s.slotSeq[i][a.peer] = s.now, a.seq
 		s.rpc(i, a.peer, "append", func(dst *core) func(*core) {
 			reply := &AppendEntriesReply{}
 			dst.handleAppendEntries(a.args, reply)
-			return func(src *core) { src.onAppendReply(a.peer, a.ni, a.args, reply) }
-		}, true)
+			return func(src *core) { src.onAppendReply(a.peer, a.ni, a.seq, a.args, reply) }
+		}, func(src *core) { src.onAppendLost(a.peer, a.seq) }, true)
 	}
 	s.onApply(i, rd.Apply)
 	return true
@@ -410,6 +428,13 @@ func (s *detSim) checkLight() {
 			s.fail("node %d commitIndex went back %d -> %d", i, s.seenCommit[i], r.commitIndex)
 		}
 		if r.state == Leader {
+			// An in-flight slot must be freed by a reply or the timeout event; one
+			// that outlives RPCTimeout would starve that follower of heartbeats.
+			for p := 0; p < s.n; p++ {
+				if r.inflight[p] && r.inflightSeq[p] == s.slotSeq[i][p] && s.now-s.slotAt[i][p] > RPCTimeout {
+					s.fail("STUCK SLOT: leader %d has had an AppendEntries to %d in flight for %v (> RPCTimeout)", i, p, s.now-s.slotAt[i][p])
+				}
+			}
 			if prev, ok := s.leaderOf[r.currentTerm]; ok && prev != i {
 				s.fail("ELECTION SAFETY: nodes %d and %d both leader in term %d", prev, i, r.currentTerm)
 			}

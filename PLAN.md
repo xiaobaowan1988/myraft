@@ -76,6 +76,26 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
     重启后又投给同任期的另一候选人且两人都凑够多数，组合太稀有，属于已知检测盲区。
     教训：写变异时要确认它真的改变了行为（本阶段有两个变异因模拟器的可达性/返回值逻辑而是空操作）。
 
+- [x] **9. 限制在途协程数量（RPC 超时 + 每个 follower 至多一个在途 AppendEntries）**：
+  - 问题：此前每次广播都起新协程，对端卡住时数量无上限。
+  - `Transport` 方法增加 `context.Context` 参数；外壳用 `RPCTimeout`（默认 80ms）为每个 RPC 设超时，
+    超时即视为丢失。Transport 实现必须遵守 ctx（SimNet 已遵守）。
+  - 状态机内新增 per-peer `inflight` + 序号 `seq`：`replicate` 在已有在途请求时直接跳过（心跳也一样）；
+    应答（任意任期内的有效应答）或新增的 `onAppendLost(peer, seq)`（超时/丢失事件）才会释放名额；
+    释放按 `seq` 匹配，过期的应答/超时不会误释放新请求的名额；成为 Leader 时重置。
+    成功应答后若还有未发送的日志，立即继续发送（避免吞吐被心跳间隔限制）。
+  - 约束：`RPCTimeout + HeartbeatInterval < ElectionTimeoutMin`，否则一次丢包可能让 follower 超过选举超时（测试断言）。
+  - 投票请求不设名额：它们受超时限制，且选举间隔（≥150ms）大于超时，在途数量天然有界。
+  - 模拟器同步：每个 AppendEntries 另排一个 +RPCTimeout 的超时事件；超过期限才到达的应答被丢弃（与外壳一致）；
+    请求本身仍可迟到并被对端处理。
+  - 新测试：`TestInFlightBounded`——对端永不应答（一种遵守 ctx，一种完全无视 ctx）时，协程数量必须有界。
+  - 上界：每节点常驻 2 个 + 至多 (n-1) 个 AppendEntries + 至多 (n-1) 个投票请求。
+  - 验证：`TestInFlightBounded` 去掉名额限制后失败（协程多出 74 个、每个 follower 同时 37 个请求在途），
+    恢复后通过。模拟器新增不变量 `STUCK SLOT`：Leader 的在途名额存在超过 `RPCTimeout` 即失败；
+    "超时不释放名额"的变异 300 个种子全部被检出，正常代码 2000 个种子通过。
+    教训：该变异不会让正常的收敛/进展检查失败（被冷落的 follower 会选举超时，系统靠换届自愈，只是性能变差），
+    最初的"恢复后任期稳定"检查也抓不到，改为直接检查机制本身才有效。
+
 ## 与原指南的有意偏差（原因）
 
 1. **Ticker 用 10ms 轮询 + deadline，而不是 `time.Timer` 通道**：`Timer.Reset` 需要先 drain 通道，

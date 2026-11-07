@@ -15,19 +15,29 @@ var (
 	tickInterval       = 10 * time.Millisecond
 )
 
-// Raft is one consensus node. All mutable state is guarded by mu; mu is never
-// held across a network call or an applyCh send.
+// Raft is one consensus node, built as a single-goroutine event loop.
+//
+// Concurrency rules (see PLAN.md):
+//   - Every field below the "loop-owned" marker is read and written ONLY by the
+//     run() goroutine. There is no mutex.
+//   - Outside code (RPC handlers, Start, State, RPC reply goroutines) never
+//     touches that state; it posts a closure to events and the loop runs it.
+//   - Code running inside the loop must never block on the network, nor post to
+//     events and wait for it (that would deadlock the loop).
 type Raft struct {
-	mu   sync.Mutex
-	me   int
-	n    int
-	tr   Transport
-	st   Storage
-	dead bool
-	done chan struct{}
+	me int
+	n  int
+	tr Transport
+	st Storage
 
+	events    chan func()
+	applyFeed chan []ApplyMsg
 	applyCh   chan ApplyMsg
-	applyCond *sync.Cond
+	done      chan struct{}
+	stopped   chan struct{} // closed when run() has exited
+	killOnce  sync.Once
+
+	// ---- loop-owned state ----
 
 	// Persistent (written to st before replying to any RPC).
 	currentTerm int
@@ -36,7 +46,7 @@ type Raft struct {
 
 	// Volatile.
 	commitIndex int
-	lastApplied int
+	lastApplied int // highest index handed to applyPump
 	state       int
 
 	// Leader only.
@@ -60,53 +70,123 @@ func Make(me, n int, tr Transport, st Storage, applyCh chan ApplyMsg) (*Raft, er
 	}
 	r := &Raft{
 		me: me, n: n, tr: tr, st: st, applyCh: applyCh,
+		events:      make(chan func()), // unbuffered: a successful post means the loop took it and will run it
+		applyFeed:   make(chan []ApplyMsg, 16),
 		done:        make(chan struct{}),
+		stopped:     make(chan struct{}),
 		currentTerm: term, votedFor: votedFor, log: log,
 		state: Follower,
 		rng:   rand.New(rand.NewSource(time.Now().UnixNano() + int64(me)*7919)),
 	}
-	r.applyCond = sync.NewCond(&r.mu)
-	r.resetElectionLocked()
-	go r.ticker()
-	go r.applier()
+	r.resetElection()
+	go r.run()
+	go r.applyPump()
 	return r, nil
 }
 
-// Kill stops the node. After Kill returns it performs no further writes.
+// Kill stops the node and waits for the event loop to exit, so after Kill
+// returns the node performs no further writes to storage.
 func (r *Raft) Kill() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.dead {
-		return
+	r.killOnce.Do(func() { close(r.done) })
+	<-r.stopped
+}
+
+// post schedules f on the event loop. It reports false if the node is dead,
+// in which case f will never run. Once post returns true, f is guaranteed to
+// run to completion.
+func (r *Raft) post(f func()) bool {
+	select {
+	case r.events <- f:
+		return true
+	case <-r.done:
+		return false
 	}
-	r.dead = true
-	close(r.done)
-	r.applyCond.Broadcast()
 }
 
 // State returns the current term and whether this node believes it is leader.
 func (r *Raft) State() (term int, isLeader bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.currentTerm, r.state == Leader && !r.dead
+	resp := make(chan struct{})
+	if !r.post(func() {
+		term, isLeader = r.currentTerm, r.state == Leader
+		close(resp)
+	}) {
+		return 0, false
+	}
+	<-resp
+	return term, isLeader
 }
 
 // Start proposes cmd (must be non-nil). It returns the index and term the
 // command will have if it is ever committed, and whether this node is leader.
 func (r *Raft) Start(cmd interface{}) (index, term int, isLeader bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.dead || r.state != Leader || cmd == nil {
+	index, term = -1, -1
+	resp := make(chan struct{})
+	if cmd == nil || !r.post(func() {
+		defer close(resp)
+		if r.state != Leader {
+			return
+		}
+		r.appendLocal(LogEntry{Term: r.currentTerm, Command: cmd})
+		index, term, isLeader = len(r.log)-1, r.currentTerm, true
+		r.broadcast()
+	}) {
 		return -1, -1, false
 	}
-	e := LogEntry{Term: r.currentTerm, Command: cmd}
-	r.appendLocal(e)
-	idx := len(r.log) - 1
-	r.broadcastLocked()
-	return idx, r.currentTerm, true
+	<-resp
+	return index, term, isLeader
 }
 
-// ---- helpers (lock held) ----
+// RequestVote is the RPC entry point; it runs the handler on the event loop.
+func (r *Raft) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
+	reply := &RequestVoteReply{}
+	resp := make(chan struct{})
+	if !r.post(func() { r.handleRequestVote(args, reply); close(resp) }) {
+		return reply
+	}
+	<-resp
+	return reply
+}
+
+// AppendEntries is the RPC entry point; it runs the handler on the event loop.
+func (r *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
+	reply := &AppendEntriesReply{}
+	resp := make(chan struct{})
+	if !r.post(func() { r.handleAppendEntries(args, reply); close(resp) }) {
+		return reply
+	}
+	<-resp
+	return reply
+}
+
+// ---- event loop ----
+
+func (r *Raft) run() {
+	defer close(r.stopped)
+	t := time.NewTicker(tickInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-r.done:
+			return
+		case f := <-r.events:
+			f()
+		case <-t.C:
+			r.onTick()
+		}
+	}
+}
+
+func (r *Raft) onTick() {
+	if r.state == Leader {
+		if time.Since(r.lastBroadcast) >= HeartbeatInterval {
+			r.broadcast()
+		}
+	} else if time.Now().After(r.electionDeadline) {
+		r.startElection()
+	}
+}
+
+// ---- helpers (loop only) ----
 
 func (r *Raft) persist(recs ...Record) {
 	if err := r.st.Append(recs); err != nil {
@@ -119,13 +199,13 @@ func (r *Raft) persistMeta() {
 	r.persist(Record{Kind: recMeta, Term: r.currentTerm, VotedFor: r.votedFor})
 }
 
-func (r *Raft) resetElectionLocked() {
+func (r *Raft) resetElection() {
 	span := ElectionTimeoutMax - ElectionTimeoutMin
 	r.electionDeadline = time.Now().Add(ElectionTimeoutMin + time.Duration(r.rng.Int63n(int64(span))))
 }
 
-// becomeFollowerLocked steps down; a higher term clears the vote and is persisted.
-func (r *Raft) becomeFollowerLocked(term int) {
+// becomeFollower steps down; a higher term clears the vote and is persisted.
+func (r *Raft) becomeFollower(term int) {
 	r.state = Follower
 	if term > r.currentTerm {
 		r.currentTerm = term
@@ -142,11 +222,11 @@ func (r *Raft) appendLocal(e LogEntry) {
 	r.matchIndex[r.me] = idx
 	r.nextIndex[r.me] = idx + 1
 	if r.n == 1 {
-		r.advanceCommitLocked()
+		r.advanceCommit()
 	}
 }
 
-func (r *Raft) becomeLeaderLocked() {
+func (r *Raft) becomeLeader() {
 	r.state = Leader
 	r.nextIndex = make([]int, r.n)
 	r.matchIndex = make([]int, r.n)
@@ -155,10 +235,10 @@ func (r *Raft) becomeLeaderLocked() {
 	}
 	// No-op so entries from earlier terms can be committed indirectly.
 	r.appendLocal(LogEntry{Term: r.currentTerm})
-	r.broadcastLocked()
+	r.broadcast()
 }
 
-func (r *Raft) advanceCommitLocked() {
+func (r *Raft) advanceCommit() {
 	for idx := len(r.log) - 1; idx > r.commitIndex; idx-- {
 		if r.log[idx].Term != r.currentTerm {
 			break // only count replicas for current-term entries
@@ -170,54 +250,67 @@ func (r *Raft) advanceCommitLocked() {
 			}
 		}
 		if cnt > r.n/2 {
-			r.commitIndex = idx
-			r.applyCond.Broadcast()
+			r.setCommit(idx)
 			break
 		}
 	}
 }
 
-// ---- ticker / election ----
-
-func (r *Raft) ticker() {
-	t := time.NewTicker(tickInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-r.done:
-			return
-		case <-t.C:
-		}
-		r.mu.Lock()
-		if r.dead {
-			r.mu.Unlock()
-			return
-		}
-		if r.state == Leader {
-			if time.Since(r.lastBroadcast) >= HeartbeatInterval {
-				r.broadcastLocked()
-			}
-		} else if time.Now().After(r.electionDeadline) {
-			r.startElectionLocked()
-		}
-		r.mu.Unlock()
+// setCommit raises commitIndex and hands newly committed entries to applyPump.
+func (r *Raft) setCommit(idx int) {
+	if idx <= r.commitIndex {
+		return
+	}
+	r.commitIndex = idx
+	var msgs []ApplyMsg
+	for r.lastApplied < r.commitIndex {
+		r.lastApplied++
+		e := r.log[r.lastApplied]
+		msgs = append(msgs, ApplyMsg{CommandValid: e.Command != nil, Command: e.Command, CommandIndex: r.lastApplied})
+	}
+	select {
+	case r.applyFeed <- msgs: // pump always drains promptly, so this does not stall the loop
+	case <-r.done:
 	}
 }
 
-func (r *Raft) startElectionLocked() {
+// applyPump is an unbounded, lock-free queue between the event loop and the
+// (possibly slow) consumer of applyCh.
+func (r *Raft) applyPump() {
+	var queue []ApplyMsg
+	for {
+		var out chan ApplyMsg
+		var head ApplyMsg
+		if len(queue) > 0 {
+			out, head = r.applyCh, queue[0]
+		}
+		select {
+		case batch := <-r.applyFeed:
+			queue = append(queue, batch...)
+		case out <- head:
+			queue = queue[1:]
+		case <-r.done:
+			return
+		}
+	}
+}
+
+// ---- election ----
+
+func (r *Raft) startElection() {
 	r.state = Candidate
 	r.currentTerm++
 	r.votedFor = r.me
 	r.persistMeta()
-	r.resetElectionLocked()
+	r.resetElection()
 	term := r.currentTerm
 	if r.n == 1 {
-		r.becomeLeaderLocked()
+		r.becomeLeader()
 		return
 	}
 	lastIdx := len(r.log) - 1
 	args := &RequestVoteArgs{Term: term, CandidateID: r.me, LastLogIndex: lastIdx, LastLogTerm: r.log[lastIdx].Term}
-	votes := 1
+	votes := 1 // only touched by loop closures
 	for peer := 0; peer < r.n; peer++ {
 		if peer == r.me {
 			continue
@@ -227,38 +320,32 @@ func (r *Raft) startElectionLocked() {
 			if !ok {
 				return
 			}
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			if r.dead {
-				return
-			}
-			if reply.Term > r.currentTerm {
-				r.becomeFollowerLocked(reply.Term)
-				return
-			}
-			if r.state != Candidate || r.currentTerm != term {
-				return // stale reply
-			}
-			if reply.VoteGranted {
-				votes++
-				if votes > r.n/2 {
-					r.becomeLeaderLocked()
+			r.post(func() {
+				if reply.Term > r.currentTerm {
+					r.becomeFollower(reply.Term)
+					return
 				}
-			}
+				if r.state != Candidate || r.currentTerm != term {
+					return // stale reply
+				}
+				if reply.VoteGranted {
+					votes++
+					if votes > r.n/2 {
+						r.becomeLeader()
+					}
+				}
+			})
 		}(peer)
 	}
 }
 
-// RequestVote handles an incoming vote request.
-func (r *Raft) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	reply := &RequestVoteReply{Term: r.currentTerm}
-	if r.dead || args.Term < r.currentTerm {
-		return reply
+func (r *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	reply.Term = r.currentTerm
+	if args.Term < r.currentTerm {
+		return
 	}
 	if args.Term > r.currentTerm {
-		r.becomeFollowerLocked(args.Term)
+		r.becomeFollower(args.Term)
 		reply.Term = r.currentTerm
 	}
 	lastIdx := len(r.log) - 1
@@ -267,27 +354,26 @@ func (r *Raft) RequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	if (r.votedFor == -1 || r.votedFor == args.CandidateID) && upToDate {
 		r.votedFor = args.CandidateID
 		r.persistMeta() // durable before the vote is revealed
-		r.resetElectionLocked()
+		r.resetElection()
 		reply.VoteGranted = true
 	}
-	return reply
 }
 
 // ---- replication ----
 
-func (r *Raft) broadcastLocked() {
+func (r *Raft) broadcast() {
 	r.lastBroadcast = time.Now()
 	for peer := 0; peer < r.n; peer++ {
 		if peer != r.me {
-			go r.replicate(peer)
+			r.replicate(peer)
 		}
 	}
 }
 
+// replicate builds the request on the loop, sends it from a helper goroutine,
+// and processes the reply back on the loop.
 func (r *Raft) replicate(peer int) {
-	r.mu.Lock()
-	if r.dead || r.state != Leader {
-		r.mu.Unlock()
+	if r.state != Leader {
 		return
 	}
 	ni := r.nextIndex[peer]
@@ -304,26 +390,25 @@ func (r *Raft) replicate(peer int) {
 		Entries:      append([]LogEntry(nil), r.log[ni:]...),
 		LeaderCommit: r.commitIndex,
 	}
-	r.mu.Unlock()
+	go func() {
+		reply, ok := r.tr.AppendEntries(peer, args)
+		if !ok {
+			return
+		}
+		r.post(func() { r.onAppendReply(peer, ni, args, reply) })
+	}()
+}
 
-	reply, ok := r.tr.AppendEntries(peer, args)
-	if !ok {
-		return
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.dead {
-		return
-	}
+func (r *Raft) onAppendReply(peer, ni int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if reply.Term > r.currentTerm {
-		r.becomeFollowerLocked(reply.Term)
-		r.resetElectionLocked()
+		r.becomeFollower(reply.Term)
+		r.resetElection()
 		return
 	}
 	if r.state != Leader || r.currentTerm != args.Term {
 		return // stale reply
 	}
+	prev := args.PrevLogIndex
 	if reply.Success {
 		match := prev + len(args.Entries)
 		if match > r.matchIndex[peer] {
@@ -332,7 +417,7 @@ func (r *Raft) replicate(peer int) {
 		if r.matchIndex[peer]+1 > r.nextIndex[peer] {
 			r.nextIndex[peer] = r.matchIndex[peer] + 1
 		}
-		r.advanceCommitLocked()
+		r.advanceCommit()
 		return
 	}
 	if r.nextIndex[peer] != ni {
@@ -340,7 +425,6 @@ func (r *Raft) replicate(peer int) {
 	}
 	next := reply.ConflictIndex
 	if reply.ConflictTerm != -1 {
-		next = reply.ConflictIndex
 		for i := len(r.log) - 1; i >= 1; i-- {
 			if r.log[i].Term == reply.ConflictTerm {
 				next = i + 1
@@ -362,25 +446,22 @@ func (r *Raft) replicate(peer int) {
 	}
 	r.nextIndex[peer] = next
 	if next < ni {
-		go r.replicate(peer) // retry immediately with the backed-off index
+		r.replicate(peer) // retry immediately with the backed-off index
 	}
 }
 
-// AppendEntries handles log replication / heartbeats from a leader.
-func (r *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	reply := &AppendEntriesReply{Term: r.currentTerm}
-	if r.dead || args.Term < r.currentTerm {
-		return reply // stale leader
-	}
-	r.becomeFollowerLocked(args.Term) // also demotes a same-term candidate
+func (r *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = r.currentTerm
-	r.resetElectionLocked()
+	if args.Term < r.currentTerm {
+		return // stale leader
+	}
+	r.becomeFollower(args.Term) // also demotes a same-term candidate
+	reply.Term = r.currentTerm
+	r.resetElection()
 
 	if args.PrevLogIndex >= len(r.log) {
 		reply.ConflictIndex, reply.ConflictTerm = len(r.log), -1
-		return reply
+		return
 	}
 	if t := r.log[args.PrevLogIndex].Term; t != args.PrevLogTerm {
 		reply.ConflictTerm = t
@@ -389,7 +470,7 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 			i--
 		}
 		reply.ConflictIndex = i
-		return reply
+		return
 	}
 
 	// Truncate only on a real conflict; matching entries (duplicates or
@@ -414,42 +495,7 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 		if lastNew < c {
 			c = lastNew
 		}
-		if c > r.commitIndex {
-			r.commitIndex = c
-			r.applyCond.Broadcast()
-		}
+		r.setCommit(c)
 	}
 	reply.Success = true
-	return reply
-}
-
-// ---- apply ----
-
-func (r *Raft) applier() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for {
-		for !r.dead && r.lastApplied >= r.commitIndex {
-			r.applyCond.Wait()
-		}
-		if r.dead {
-			return
-		}
-		var msgs []ApplyMsg
-		for r.lastApplied < r.commitIndex {
-			r.lastApplied++
-			e := r.log[r.lastApplied]
-			msgs = append(msgs, ApplyMsg{CommandValid: e.Command != nil, Command: e.Command, CommandIndex: r.lastApplied})
-		}
-		r.mu.Unlock()
-		for _, m := range msgs {
-			select {
-			case r.applyCh <- m:
-			case <-r.done:
-				r.mu.Lock()
-				return
-			}
-		}
-		r.mu.Lock()
-	}
 }

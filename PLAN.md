@@ -518,6 +518,17 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
         3. 一个客户端异常退出且不关闭，其 pub/sub 要等 `ClientLivenessTimeout`（默认 5s）才被回收，期间同 stream 的 publication 仍指向它。
         4. 位置上限只在写入前检查，每个并发发布者最多可多写一条消息；`PublicationWindow` 与最大消息长度、并发发布者数之间的约束只写在文档里，没有强制。
         5. 驱动的 `Linger` 与 `UnblockTimeout` 默认值（5s/10s）是照 Aeron 的量级选的，没有调优。
+      **21.4 实现设计（动手前先写下，与上面第 7 条的差异与细化）**：
+      - **通道**：`udp://<ip>:<port>`，只支持 IP 字面量，不做 DNS。发布端的地址是目的地；订阅端的地址是本地绑定（端口 0 = 临时端口，实际地址经 `OperationSuccess.Name` 回给客户端，`Subscription.LocalAddr()`）。只做单播、单接收者。`Config.MTU` 同时是 IPC 帧大小与 UDP 数据报上限（≤ 65000）。
+      - **线格式**：所有帧都用 log buffer 的 32 字节帧头（小端），这样数据帧可以**原样**从发送端 log 取出、原样写进接收端 log。类型：`Data`(1) / `Pad`(0) 沿用 logbuf；`Setup`(0x10)、`Status`(0x11)、`Nak`(0x12)、`Heartbeat`(0x13) 为控制帧。心跳不能用长度 32 的 Data 帧（那是合法的空消息），所以单独一个类型。
+        `Setup` 的帧头 termId/termOffset = 发送端当前位置（接收端的加入点），正文 = initialTermID、termLength、mtu。`Status` 的 termId/termOffset = 消费位置，正文 = 接收窗口。一个数据报 = 若干个完整帧（`LogBuffer.Scan` 的输出）；填充帧只发帧头，其长度字段是整段填充的长度，接收端据此重建。
+      - **谁拥有什么**（单写者）：Conductor 创建/销毁所有资源（log 文件、计数器、套接字）并把它们交给 Sender / Receiver；Sender 独占发送路径与 `snd-pos` / `snd-lmt` / `snd-cons` 计数器；Receiver 独占接收路径与 `rcv-hwm` / `rcv-pos` 计数器；Conductor 写 `img-cons`（该 image 的各订阅者位置的最小值，供 Receiver 生成 Status）与 `pub-lmt`。agent 之间通过各自的**命令队列**（带缓冲的 `chan func()`，在目标 agent 的协程里于周期开头执行）传递所有权，不共享可变状态。
+      - **发送端**：未连接（没收到 Status）时每 50ms 发 `Setup`；连接后按 `min(MTU, senderLimit - senderPosition)` 从 log 扫描发送，`senderLimit = 消费位置 + 接收窗口`（来自 Status）；空闲 100ms 发 `Heartbeat`；`ReceiverTimeout`（默认 5s）内没有 Status 则回到未连接。发布者的限制 `pub-lmt = 接收者消费位置 + PublicationWindow`，所以未被确认消费的数据始终留在 log 里（重传的前提，也保证 term 回收安全）。
+      - **接收端**：收到 `Setup` 且有匹配的订阅 → 请求 Conductor 创建 image（log 文件使用发送端的 initialTermID/termLength/mtu，所以位置与发送端一致），订阅者从 `Setup` 的位置加入。数据按位置原位写入，已存在的帧（长度非零）跳过；窗口外或早于加入点的丢弃。`rcv-pos` = 从加入点起连续的位置（扫描推进）。订阅者位置进入 term t 时清理 t+1 对应的分区。Status：创建后立刻发一个，之后每 10ms，或消费位置前进 ≥ 窗口/4 时。image 在 `ImageLivenessTimeout`（默认 10s）内没有任何数据/心跳则进入 draining（订阅者读完 `rcv-pos` 才销毁）。
+      - **非阻塞套接字**：`PacketConn` 接口（`Recv`/`Send` 都不阻塞，`Send` 在缓冲满时返回 false 而不推进位置——天然背压），真实实现用 `syscall.Recvfrom/Sendto` + `MSG_DONTWAIT`（经 `SyscallConn`），因此 agent 保持"一个周期做一轮工作"的形态；`Config.ListenPacket` 可替换，21.5 用它接入带故障注入的内存网络。
+      - **线程模式**：`DEDICATED`（Conductor/Sender/Receiver 各一个协程，默认）与 `SHARED`（一个协程轮流跑三个 agent）。
+      - **不在 21.4 做**：NAK、重传、丢包后的缺口检测（21.5）。21.4 的接收端只写入、推进连续位置；网络无丢包时这就是全部。
+      - **测试**：编解码（含畸形包）；`LogBuffer.Insert` 的原位插入、重复、乱序、填充帧；握手；有序恰好一次的传输；窗口填满后发送端停止、订阅者消费后恢复；跨多个 MTU 的大消息；多 stream、多 session 互不串扰；订阅者晚于发布者、发布者晚于订阅者；发布者/订阅者移除后的清理；`ReceiverTimeout` 与 `ImageLivenessTimeout`；跨进程；变异验证。
     - [ ] **21.4 UDP 通道（无故障网络）**：`proto` 编解码、Sender、Receiver、Setup/StatusMessage 握手、image 创建、数据传输、流控窗口、分片重组。
       测试：编解码往返与畸形包（截断、错误长度、未知类型）不 panic；握手；收发有序、恰好一次；接收窗口被填满后发送端停止、订阅者消费后恢复；大消息跨多个 MTU；两个 stream、多个 session 互不串扰。
     - [ ] **21.5 故障下的可靠性**：NAK、重传、重传抑制、心跳发现尾部丢失、重复包、乱序、迟到的订阅者（从当前位置加入而不是从头）、发送端或接收端 Driver 重启（session 变化）。

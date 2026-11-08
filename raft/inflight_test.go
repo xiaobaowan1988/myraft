@@ -23,7 +23,7 @@ func peakGoroutines(d time.Duration) int {
 	return peak
 }
 
-// The node starts exactly two goroutines (event loop and applyPump) and none per
+// The node starts exactly three goroutines (node loop, ready loop and applyPump) and none per
 // message, election or proposal; sending belongs to the transport. Here the
 // followers never answer a MsgApp, which is the worst case for anything that
 // would pile up per request.
@@ -44,8 +44,8 @@ func TestNodeStartsFixedGoroutines(t *testing.T) {
 	}
 	late := peakGoroutines(time.Second)
 	t.Logf("goroutines: base=%d idle=%d after 2000 proposals=%d", base, early, late)
-	if early-base != 2 || late-base != 2 {
-		t.Errorf("node should add exactly 2 goroutines, got +%d idle and +%d under load", early-base, late-base)
+	if early-base != 3 || late-base != 3 {
+		t.Errorf("node should add exactly 3 goroutines, got +%d idle and +%d under load", early-base, late-base)
 	}
 	if n := len(f.sentTo(1, MsgApp)) + len(f.sentTo(2, MsgApp)); n == 0 {
 		t.Error("no MsgApp was sent; the test did not exercise sending")

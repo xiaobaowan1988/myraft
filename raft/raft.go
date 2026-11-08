@@ -31,36 +31,55 @@ var (
 	MaxAppendEntries = 128
 )
 
-// Raft is the I/O shell around the pure state machine (core). One goroutine,
-// run(), owns the core and performs all I/O on its behalf:
+// Raft is the I/O shell around the pure state machine (core), built like etcd's
+// raft.Node plus the application loop that drives it, with two goroutines:
 //
-//   - Outside code (Step, ReportUnreachable, Propose, State) never touches core
-//     state; it posts a closure to events and the loop runs it.
-//   - After every event the loop calls flush, which persists first and only
-//     then sends messages and delivers committed entries.
-//   - Code on the loop must never block, nor post to events and wait for it
-//     (that would deadlock the loop).
+//   - run, the node loop, is the only goroutine that touches the core. It handles
+//     events (incoming messages, ticks, proposals) and lets the core accumulate its
+//     output. When the core has output and no Ready is outstanding it hands the
+//     output over as one Ready on readyc, then waits for advancec. It never waits for
+//     the disk: while a Ready is being written, events keep being processed and
+//     their output piles up into the next Ready (so writes batch naturally).
+//   - readyLoop takes each Ready and processes it in the only safe order: persist,
+//     then send messages, then deliver committed entries, then release callers
+//     waiting for durability; then it sends on advancec (etcd's Advance). Readys are
+//     strictly sequential, so nothing from a later Ready can become visible before
+//     an earlier one is durable.
 //
-// The node starts exactly two goroutines (run and applyPump) and none per message:
-// sending, queueing and connection handling belong to the Transport.
+// Outside code (Step, ReportUnreachable, Propose, State) never touches core
+// state; it posts a closure to events and the node loop runs it. Code on the node
+// loop must never block, nor post to events and wait for it.
 //
-// A given Storage must be used by at most one Raft at a time; Kill waits for
-// the loop to exit so a dead instance can no longer write.
+// The node starts three goroutines (run, readyLoop, applyPump) and none per
+// message: sending, queueing and connection handling belong to the Transport.
+//
+// A given Storage must be used by at most one Raft at a time; Kill waits for both
+// loops to exit so a dead instance can no longer write.
 type Raft struct {
 	c  *core
 	st Storage
 	tr Transport
 
 	events    chan func()
+	readyc    chan readyBatch
+	advancec  chan struct{}
 	applyFeed chan []ApplyMsg
 	applyCh   chan ApplyMsg
 	done      chan struct{}
 	stopped   chan struct{} // closed when run() has exited
+	rstopped  chan struct{} // closed when readyLoop() has exited
 	killOnce  sync.Once
 
-	// after holds actions to run once the current event's Ready has been
-	// persisted (releasing Propose/State callers). Loop only.
+	// after holds actions to run once the output of the events handled so far has
+	// been persisted (releasing Propose callers). Node loop only; it travels with
+	// the next Ready that is handed out.
 	after []func()
+}
+
+// readyBatch is one Ready plus the callers to release once it is durable.
+type readyBatch struct {
+	Ready
+	release []func()
 }
 
 // Raft receives messages from its transport.
@@ -91,25 +110,31 @@ func Make(me, n int, tr Transport, st Storage, applyCh chan ApplyMsg) (*Raft, er
 	r := &Raft{
 		c: c, st: st, tr: tr, applyCh: applyCh,
 		events:    make(chan func()), // unbuffered: a successful post means the loop took it and will run it
+		readyc:    make(chan readyBatch),
+		advancec:  make(chan struct{}),
 		applyFeed: make(chan []ApplyMsg, 16),
 		done:      make(chan struct{}),
 		stopped:   make(chan struct{}),
+		rstopped:  make(chan struct{}),
 	}
 	go r.run()
+	go r.readyLoop()
 	go r.applyPump()
 	return r, nil
 }
 
-// Kill stops the node and waits for the event loop to exit, so after Kill
-// returns the node performs no further writes to storage.
+// Kill stops the node and waits for both loops to exit (a Ready being written is
+// finished first), so after Kill returns the node performs no further writes.
 func (r *Raft) Kill() {
 	r.killOnce.Do(func() { close(r.done) })
 	<-r.stopped
+	<-r.rstopped
 }
 
-// post schedules f on the event loop. It reports false if the node is dead,
-// in which case f will never run. Once post returns true, f is guaranteed to
-// run to completion (and its flush too).
+// post schedules f on the node loop. It reports false if the node is dead, in
+// which case f will never run. Once post returns true, f is guaranteed to run to
+// completion (its output is handed over in a later Ready, unless the node is
+// killed first).
 func (r *Raft) post(f func()) bool {
 	select {
 	case r.events <- f:
@@ -119,7 +144,8 @@ func (r *Raft) post(f func()) bool {
 	}
 }
 
-// release schedules fn to run after this event's persistence. Loop only.
+// release schedules fn to run once the output of the events handled so far is
+// durable. Node loop only.
 func (r *Raft) release(fn func()) { r.after = append(r.after, fn) }
 
 // Step delivers an incoming message (called by the transport). It returns once
@@ -134,37 +160,52 @@ func (r *Raft) ReportUnreachable(peer int) {
 	r.post(func() { r.c.onUnreachable(peer) })
 }
 
-// State returns the current term and whether this node believes it is leader.
+// State returns the current term and whether this node believes it is leader. It
+// answers at once, without waiting for any disk write (it is only an observation).
 func (r *Raft) State() (term int, isLeader bool) {
-	resp := make(chan struct{})
-	if !r.post(func() {
-		term, isLeader = r.c.currentTerm, r.c.state == Leader
-		r.release(func() { close(resp) })
-	}) {
+	type res struct {
+		term     int
+		isLeader bool
+	}
+	ch := make(chan res, 1)
+	if !r.post(func() { ch <- res{r.c.currentTerm, r.c.state == Leader} }) {
 		return 0, false
 	}
-	<-resp
-	return term, isLeader
+	v := <-ch
+	return v.term, v.isLeader
 }
 
 // Propose appends cmd (must be non-nil) to the log if this node is the leader
 // and not overloaded. It returns the index and term the command will have if it
 // is ever committed, only after the proposal is durable on this node. It never
 // blocks on replication: errors are ErrNotLeader, ErrProposalDropped (too many
-// uncommitted entries; retry later), ErrStopped and ErrNilCommand.
+// uncommitted entries; retry later), ErrStopped and ErrNilCommand. If the node
+// is stopped while waiting, the result is ErrStopped and the outcome is unknown.
 func (r *Raft) Propose(cmd interface{}) (index, term int, err error) {
 	if cmd == nil {
 		return -1, -1, ErrNilCommand
 	}
-	resp := make(chan struct{})
+	type res struct {
+		index, term int
+		err         error
+	}
+	ch := make(chan res, 1)
 	if !r.post(func() {
-		index, term, err = r.c.propose(cmd)
-		r.release(func() { close(resp) })
+		i, t, e := r.c.propose(cmd)
+		if e != nil {
+			ch <- res{i, t, e} // nothing was staged: no need to wait for the disk
+			return
+		}
+		r.release(func() { ch <- res{i, t, nil} })
 	}) {
 		return -1, -1, ErrStopped
 	}
-	<-resp
-	return index, term, err
+	select {
+	case v := <-ch:
+		return v.index, v.term, v.err
+	case <-r.done:
+		return -1, -1, ErrStopped
+	}
 }
 
 // Start is Propose with a boolean result: ok is false if the command was not
@@ -174,30 +215,61 @@ func (r *Raft) Start(cmd interface{}) (index, term int, ok bool) {
 	return index, term, err == nil
 }
 
-// ---- event loop ----
+// ---- node loop and ready loop ----
 
+// run is the node loop (see Raft). It follows etcd's node.run: arm readyc only when
+// there is output and no Ready is outstanding.
 func (r *Raft) run() {
 	defer close(r.stopped)
 	t := time.NewTicker(tickInterval)
 	defer t.Stop()
+	var (
+		readyc      chan readyBatch // non-nil while a Ready is waiting to be taken
+		rd          readyBatch
+		outstanding bool // a Ready has been handed over and not yet advanced
+	)
 	for {
+		if !outstanding && readyc == nil && (!r.c.rd.empty() || len(r.after) > 0) {
+			rd = readyBatch{Ready: r.c.takeReady(), release: r.after}
+			r.after = nil
+			readyc = r.readyc
+		}
 		select {
 		case <-r.done:
 			return
 		case f := <-r.events:
 			f()
-			r.flush()
 		case <-t.C:
 			r.c.onTick()
-			r.flush()
+		case readyc <- rd:
+			readyc, outstanding = nil, true
+		case <-r.advancec:
+			outstanding = false
 		}
 	}
 }
 
-// flush carries out the core's Ready in the only safe order:
+// readyLoop is the application side: it carries out each Ready, one at a time.
+func (r *Raft) readyLoop() {
+	defer close(r.rstopped)
+	for {
+		select {
+		case <-r.done:
+			return
+		case rd := <-r.readyc:
+			r.process(rd)
+			select {
+			case r.advancec <- struct{}{}:
+			case <-r.done:
+				return
+			}
+		}
+	}
+}
+
+// process carries out a Ready in the only safe order:
 // persist -> send messages -> deliver apply -> release waiting callers.
-func (r *Raft) flush() {
-	rd := r.c.takeReady()
+func (r *Raft) process(rd readyBatch) {
 	if len(rd.Persist) > 0 {
 		if err := r.st.Append(rd.Persist); err != nil {
 			// Continuing without durability would violate Raft's safety.
@@ -209,14 +281,13 @@ func (r *Raft) flush() {
 	}
 	if len(rd.Apply) > 0 {
 		select {
-		case r.applyFeed <- rd.Apply: // applyPump always drains promptly, so this does not stall the loop
+		case r.applyFeed <- rd.Apply: // applyPump always drains promptly, so this does not stall
 		case <-r.done:
 		}
 	}
-	for _, fn := range r.after {
+	for _, fn := range rd.release {
 		fn()
 	}
-	r.after = r.after[:0]
 }
 
 // applyPump is an unbounded, lock-free queue between the event loop and the

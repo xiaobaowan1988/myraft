@@ -54,6 +54,8 @@ func (h *eventHeap) Pop() any {
 
 // ---- simulator ----
 
+type voteKey struct{ node, term, vote int }
+
 type detSim struct {
 	seed int64
 	rng  *rand.Rand
@@ -87,13 +89,16 @@ type detSim struct {
 	committed      []LogEntry  // index -> first entry seen committed (Term 0 = unknown)
 	commitTerm     []int       // index -> term in which it was first committed (the committing leader's term)
 	seenCommit     []int
-	maxTerm        []int
+	durTerm        []int            // term in the node's last durable meta record
+	durVotes       map[voteKey]bool // every (node, term, votedFor) that has been made durable
 	applied        []map[int]interface{}
 	appliedAny     map[int]interface{}
 	expectApply    []int
 	nextCmd        int
 	rejected       int      // proposals refused by the uncommitted-entries limit
 	unreachPending [][]bool // [from][to] an unreachable report is already queued
+	busy           []bool   // a Ready is outstanding (being written) for the node
+	diskStall      float64  // probability that a write stalls longer than the election timeout
 	// coverage counters
 	unreachables, timeouts, maxPipe int
 }
@@ -107,10 +112,10 @@ func newDetSim(seed int64, dump bool) *detSim {
 		stores: make([]*MemStorage, n),
 		up:     make([]bool, n), epoch: make([]int, n), group: make([]int, n),
 		h: fnv.New64a(), dumpAll: dump,
-		leaderOf: map[int]int{}, seenCommit: make([]int, n), maxTerm: make([]int, n),
+		leaderOf: map[int]int{}, seenCommit: make([]int, n), durTerm: make([]int, n), durVotes: map[voteKey]bool{},
 		applied: make([]map[int]interface{}, n), appliedAny: map[int]interface{}{},
 		expectApply: make([]int, n), nextCmd: 1000,
-		unreachPending: make([][]bool, n),
+		unreachPending: make([][]bool, n), busy: make([]bool, n),
 	}
 	for i := 0; i < n; i++ {
 		s.unreachPending[i] = make([]bool, n)
@@ -149,6 +154,9 @@ func (s *detSim) boot(i int) {
 		return
 	}
 	s.nodes[i], s.up[i] = r, true
+	s.busy[i] = false
+	s.durTerm[i] = r.currentTerm // restored from the store: what is durable
+	s.durVotes[voteKey{i, r.currentTerm, r.votedFor}] = true
 	s.expectApply[i], s.seenCommit[i] = 1, 0
 	s.tickLoop(i, ep)
 }
@@ -245,31 +253,72 @@ func (s *detSim) reportUnreachable(from, to int) {
 	})
 }
 
-// flush carries out node i's Ready in the same order as Raft.flush:
-// persist -> send -> apply. Crash points are injected at the two persistence
-// boundaries; it returns false if the node crashed (the rest of the Ready is
-// then lost, exactly like a real process death).
+// diskDelay is how long a Ready takes to reach the disk: usually a few
+// milliseconds, sometimes tens, rarely a stall longer than the append timeout.
+func (s *detSim) diskDelay() time.Duration {
+	switch r := s.rng.Float64(); {
+	case r < s.diskStall:
+		return 150 * time.Millisecond
+	case r < 0.10+s.diskStall:
+		return time.Duration(10+s.rng.Intn(30)) * time.Millisecond
+	default:
+		return time.Duration(s.rng.Intn(3000)) * time.Microsecond
+	}
+}
+
+// flush mirrors the node loop's Ready/Advance handshake. If no Ready is
+// outstanding and the core has output, the output is handed over as ONE Ready and
+// written after diskDelay: persist, then send, then apply, in that order, then the
+// "advance" that lets the next Ready go. While a Ready is being written the node
+// keeps processing events and their output piles up for the next Ready. A crash
+// while a Ready is outstanding loses all of it; crash points sit on both sides of
+// the persist, as before. It always returns true (the node may crash later).
 func (s *detSim) flush(i int) bool {
-	c := s.nodes[i]
-	rd := c.takeReady()
-	if rd.empty() {
+	if s.busy[i] || !s.up[i] {
 		return true
 	}
-	if s.crashAt(i, "before persist") {
-		return false // nothing durable, nothing sent
+	c := s.nodes[i]
+	if c.rd.empty() {
+		return true
 	}
-	if len(rd.Persist) > 0 {
-		if err := s.stores[i].Append(rd.Persist); err != nil {
-			s.fail("node %d persist: %v", i, err)
+	rd := c.takeReady()
+	s.busy[i] = true
+	ep := s.epoch[i]
+	s.after(s.diskDelay(), fmt.Sprintf("ready %d", i), func() {
+		if s.epoch[i] != ep {
+			return // crashed while this Ready was in flight: it is lost
 		}
-	}
-	if s.crashAt(i, "after persist, before send") {
-		return false // durable, but messages/apply never left
-	}
-	for _, m := range rd.Messages {
-		s.send(i, m)
-	}
-	s.onApply(i, rd.Apply)
+		if s.crashAt(i, "before persist") {
+			return // nothing durable, nothing sent
+		}
+		if len(rd.Persist) > 0 {
+			if err := s.stores[i].Append(rd.Persist); err != nil {
+				s.fail("node %d persist: %v", i, err)
+			}
+			for _, rec := range rd.Persist {
+				if rec.Kind == recMeta {
+					s.durTerm[i] = rec.Term
+					s.durVotes[voteKey{i, rec.Term, rec.VotedFor}] = true
+				}
+			}
+		}
+		if s.crashAt(i, "after persist, before send") {
+			return // durable, but messages/apply never left
+		}
+		for _, m := range rd.Messages {
+			// Nothing may become visible before the state it depends on is durable.
+			if m.Term > s.durTerm[i] {
+				s.fail("REVEALED BEFORE DURABLE: node %d sent %s with term %d but only term %d is durable", i, m.Type, m.Term, s.durTerm[i])
+			}
+			if m.Type == MsgVoteResp && m.Granted && !s.durVotes[voteKey{i, m.Term, m.To}] {
+				s.fail("VOTE NOT DURABLE: node %d granted node %d in term %d but that vote is not on disk", i, m.To, m.Term)
+			}
+			s.send(i, m)
+		}
+		s.onApply(i, rd.Apply)
+		s.busy[i] = false
+		s.flush(i) // Advance: whatever piled up meanwhile goes out as the next Ready
+	})
 	return true
 }
 
@@ -377,6 +426,7 @@ func (s *detSim) healAll() {
 		s.group[i] = 0
 	}
 	s.drop, s.dup, s.maxDelay, s.longRate, s.crashRate = 0, 0, 5*time.Millisecond, 0, 0
+	s.diskStall = 0 // the disk recovers together with the network
 	for i := range s.up {
 		if !s.up[i] {
 			s.boot(i)
@@ -425,10 +475,11 @@ func (s *detSim) checkLight() {
 			continue
 		}
 		r := s.nodes[i]
-		if r.currentTerm < s.maxTerm[i] {
-			s.fail("node %d term went back %d -> %d", i, s.maxTerm[i], r.currentTerm)
+		// The in-memory term may run ahead of the durable one (a bump waiting in an
+		// unwritten Ready), never behind.
+		if r.currentTerm < s.durTerm[i] {
+			s.fail("node %d volatile term %d is below its durable term %d", i, r.currentTerm, s.durTerm[i])
 		}
-		s.maxTerm[i] = r.currentTerm
 		if r.commitIndex >= len(r.log) {
 			s.fail("node %d commitIndex %d >= log length %d", i, r.commitIndex, len(r.log))
 			continue
@@ -566,6 +617,7 @@ func runSim(seed int64, dump bool) simResult {
 	s := newDetSim(seed, dump)
 	s.drop, s.dup, s.maxDelay, s.longRate, s.longDelay = 0.15, 0.05, 20*time.Millisecond, 0.05, 500*time.Millisecond
 	s.crashRate = 0.006
+	s.diskStall = 0.01
 	const chaosEnd, clientEnd, end = 12 * time.Second, 18 * time.Second, 21 * time.Second
 	s.clientLoop(clientEnd)
 	s.faultLoop(chaosEnd)

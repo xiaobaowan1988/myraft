@@ -74,7 +74,12 @@ func ackApp(m Message) []Message {
 
 func startNode(t *testing.T, f *fakePeers, applyCh chan ApplyMsg) *Raft {
 	t.Helper()
-	r, err := Make(0, 3, f, &MemStorage{}, applyCh)
+	return startNodeWith(t, f, &MemStorage{}, applyCh)
+}
+
+func startNodeWith(t *testing.T, f *fakePeers, st Storage, applyCh chan ApplyMsg) *Raft {
+	t.Helper()
+	r, err := Make(0, 3, f, st, applyCh)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,6 +18,10 @@ var (
 	// in them. Keep RPCTimeout + HeartbeatInterval < ElectionTimeoutMin, or one
 	// lost heartbeat can let a follower time out.
 	RPCTimeout = 80 * time.Millisecond
+
+	// MaxUncommittedEntries bounds the leader's log entries awaiting commit; past
+	// it, Propose fails with ErrProposalDropped. <= 0 disables the limit.
+	MaxUncommittedEntries = 1024
 )
 
 // Raft is the I/O shell around the pure state machine (core). One goroutine,
@@ -117,19 +121,31 @@ func (r *Raft) State() (term int, isLeader bool) {
 	return term, isLeader
 }
 
-// Start proposes cmd (must be non-nil). It returns the index and term the
-// command will have if it is ever committed, and whether this node is leader.
-// It returns only after the proposal is durable on this node.
-func (r *Raft) Start(cmd interface{}) (index, term int, isLeader bool) {
+// Propose appends cmd (must be non-nil) to the log if this node is the leader
+// and not overloaded. It returns the index and term the command will have if it
+// is ever committed, only after the proposal is durable on this node. It never
+// blocks on replication: errors are ErrNotLeader, ErrProposalDropped (too many
+// uncommitted entries; retry later), ErrStopped and ErrNilCommand.
+func (r *Raft) Propose(cmd interface{}) (index, term int, err error) {
+	if cmd == nil {
+		return -1, -1, ErrNilCommand
+	}
 	resp := make(chan struct{})
-	if cmd == nil || !r.post(func() {
-		index, term, isLeader = r.c.propose(cmd)
+	if !r.post(func() {
+		index, term, err = r.c.propose(cmd)
 		r.release(func() { close(resp) })
 	}) {
-		return -1, -1, false
+		return -1, -1, ErrStopped
 	}
 	<-resp
-	return index, term, isLeader
+	return index, term, err
+}
+
+// Start is Propose with a boolean result: ok is false if the command was not
+// accepted for any reason (not leader, overloaded, stopped).
+func (r *Raft) Start(cmd interface{}) (index, term int, ok bool) {
+	index, term, err := r.Propose(cmd)
+	return index, term, err == nil
 }
 
 // RequestVote is the RPC entry point. The reply is released only after any

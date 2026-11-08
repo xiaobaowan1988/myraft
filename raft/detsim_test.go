@@ -92,6 +92,7 @@ type detSim struct {
 	appliedAny  map[int]interface{}
 	expectApply []int
 	nextCmd     int
+	rejected    int               // proposals refused by the uncommitted-entries limit
 	slotAt      [][]time.Duration // [leader][peer]: when the current in-flight AppendEntries was sent
 	slotSeq     [][]uint64
 }
@@ -304,8 +305,11 @@ func (s *detSim) clientLoop(until time.Duration) {
 			return
 		}
 		if i := s.rng.Intn(s.n); s.up[i] {
-			if _, _, ok := s.nodes[i].propose(s.nextCmd); ok {
+			switch _, _, err := s.nodes[i].propose(s.nextCmd); err {
+			case nil:
 				s.nextCmd++
+			case ErrProposalDropped:
+				s.rejected++
 			}
 			s.flush(i)
 		}
@@ -435,6 +439,19 @@ func (s *detSim) checkLight() {
 					s.fail("STUCK SLOT: leader %d has had an AppendEntries to %d in flight for %v (> RPCTimeout)", i, p, s.now-s.slotAt[i][p])
 				}
 			}
+			// Backpressure: entries this leader appended in its own term and has not
+			// committed stay within the limit (+1 for the term's no-op).
+			if MaxUncommittedEntries > 0 {
+				own := 0
+				for idx := r.commitIndex + 1; idx < len(r.log); idx++ {
+					if r.log[idx].Term == r.currentTerm {
+						own++
+					}
+				}
+				if own > MaxUncommittedEntries+1 {
+					s.fail("BACKPRESSURE: leader %d has %d uncommitted entries of its own term (limit %d)", i, own, MaxUncommittedEntries)
+				}
+			}
 			if prev, ok := s.leaderOf[r.currentTerm]; ok && prev != i {
 				s.fail("ELECTION SAFETY: nodes %d and %d both leader in term %d", prev, i, r.currentTerm)
 			}
@@ -511,9 +528,13 @@ type simResult struct {
 	trace      []string
 	finalIndex int
 	events     int
+	rejected   int
 }
 
 func runSim(seed int64, dump bool) simResult {
+	// A small limit so the backpressure path is exercised (e.g. by a leader cut off in a minority).
+	defer func(old int) { MaxUncommittedEntries = old }(MaxUncommittedEntries)
+	MaxUncommittedEntries = 20
 	s := newDetSim(seed, dump)
 	s.drop, s.dup, s.maxDelay, s.longRate, s.longDelay = 0.15, 0.05, 20*time.Millisecond, 0.05, 500*time.Millisecond
 	s.crashRate = 0.006
@@ -532,7 +553,7 @@ func runSim(seed int64, dump bool) simResult {
 			fmt.Fprintf(s.h, "node %d term=%d vote=%d state=%d commit=%d log=%v\n", i, r.currentTerm, r.votedFor, r.state, r.commitIndex, r.log)
 		}
 	}
-	res := simResult{hash: s.h.Sum64(), failures: s.failures, recent: s.recent, trace: s.trace, events: s.events}
+	res := simResult{hash: s.h.Sum64(), failures: s.failures, recent: s.recent, trace: s.trace, events: s.events, rejected: s.rejected}
 	if len(s.committed) > 0 {
 		res.finalIndex = len(s.committed) - 1
 	}
@@ -589,6 +610,7 @@ func TestDeterministicReplay(t *testing.T) {
 		}
 	}
 	hashes := map[uint64]int64{}
+	totalRejected := 0
 	for _, seed := range seeds {
 		seed := seed
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
@@ -604,11 +626,15 @@ func TestDeterministicReplay(t *testing.T) {
 			if a.hash != b.hash || a.events != b.events {
 				t.Fatalf("NOT DETERMINISTIC: seed %d hash %x (%d events) vs %x (%d events)", seed, a.hash, a.events, b.hash, b.events)
 			}
-			t.Logf("events=%d finalCommitIndex=%d hash=%x", a.events, a.finalIndex, a.hash)
+			totalRejected += a.rejected
+			t.Logf("events=%d finalCommitIndex=%d rejected=%d hash=%x", a.events, a.finalIndex, a.rejected, a.hash)
 			if other, dup := hashes[a.hash]; dup {
 				t.Errorf("seeds %d and %d produced the same trace hash; hash is not sensitive", other, seed)
 			}
 			hashes[a.hash] = seed
 		})
+	}
+	if len(seeds) >= 20 && totalRejected == 0 && !t.Failed() {
+		t.Error("no proposal was ever rejected: the backpressure path is not being exercised")
 	}
 }

@@ -176,14 +176,22 @@ func (c *core) setCommit(idx int) {
 	}
 }
 
-// propose appends cmd if this node is leader.
-func (c *core) propose(cmd interface{}) (index, term int, ok bool) {
+// uncommitted is the number of log entries the leader has not yet committed.
+func (c *core) uncommitted() int { return len(c.log) - 1 - c.commitIndex }
+
+// propose appends cmd if this node is leader and not overloaded. It never blocks:
+// when too many entries are waiting to commit it rejects with ErrProposalDropped
+// so a stalled leader's log cannot grow without bound.
+func (c *core) propose(cmd interface{}) (index, term int, err error) {
 	if c.state != Leader {
-		return -1, -1, false
+		return -1, -1, ErrNotLeader
+	}
+	if MaxUncommittedEntries > 0 && c.uncommitted() >= MaxUncommittedEntries {
+		return -1, -1, ErrProposalDropped
 	}
 	c.appendLocal(LogEntry{Term: c.currentTerm, Command: cmd})
 	c.broadcast()
-	return len(c.log) - 1, c.currentTerm, true
+	return len(c.log) - 1, c.currentTerm, nil
 }
 
 // ---- time ----

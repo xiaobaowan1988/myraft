@@ -1,0 +1,113 @@
+package raft
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// gatedTransport models a 3-node cluster from node 0's side: peer 1 grants
+// votes, and AppendEntries to either peer fails (blocks until timeout) while
+// the gate is closed, or succeeds once it is open.
+type gatedTransport struct{ open atomic.Bool }
+
+func (g *gatedTransport) RequestVote(ctx context.Context, to int, args *RequestVoteArgs) (*RequestVoteReply, bool) {
+	if to == 1 {
+		return &RequestVoteReply{Term: args.Term, VoteGranted: true}, true
+	}
+	<-ctx.Done()
+	return nil, false
+}
+
+func (g *gatedTransport) AppendEntries(ctx context.Context, to int, args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
+	if g.open.Load() {
+		return &AppendEntriesReply{Term: args.Term, Success: true}, true
+	}
+	<-ctx.Done()
+	return nil, false
+}
+
+func setMaxUncommitted(t *testing.T, n int) {
+	old := MaxUncommittedEntries
+	MaxUncommittedEntries = n
+	t.Cleanup(func() { MaxUncommittedEntries = old })
+}
+
+func becomeLeader(t *testing.T, r *Raft) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, isL := r.State(); isL {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("never became leader")
+}
+
+// A leader that cannot commit must stop accepting proposals at the limit, so
+// its log stays bounded; once commits resume it accepts again.
+func TestProposalBackpressure(t *testing.T) {
+	const limit = 10
+	setMaxUncommitted(t, limit)
+	tr := &gatedTransport{}
+	r, err := Make(0, 3, tr, &MemStorage{}, make(chan ApplyMsg, 1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Kill()
+	becomeLeader(t, r)
+
+	// The election no-op is uncommitted and counts, so exactly limit-1 fit.
+	accepted, dropped := 0, 0
+	for i := 1; i <= 50; i++ {
+		_, _, err := r.Propose(i)
+		switch {
+		case err == nil:
+			accepted++
+		case errors.Is(err, ErrProposalDropped):
+			dropped++
+		default:
+			t.Fatalf("Propose(%d): unexpected error %v", i, err)
+		}
+	}
+	if accepted != limit-1 || dropped != 50-(limit-1) {
+		t.Fatalf("accepted=%d dropped=%d, want accepted=%d dropped=%d", accepted, dropped, limit-1, 50-(limit-1))
+	}
+
+	// Let replication succeed: entries commit, room opens up, proposals work again.
+	tr.open.Store(true)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, _, err := r.Propose("after-recovery"); err == nil {
+			return
+		} else if !errors.Is(err, ErrProposalDropped) {
+			t.Fatalf("unexpected error after recovery: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("proposals were still dropped after replication resumed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestProposeErrors(t *testing.T) {
+	tr := &gatedTransport{}
+	r, err := Make(0, 3, tr, &MemStorage{}, make(chan ApplyMsg, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.Propose(nil); !errors.Is(err, ErrNilCommand) {
+		t.Errorf("nil command: got %v, want ErrNilCommand", err)
+	}
+	// Follower at start (no election yet within a few ms).
+	if _, _, err := r.Propose(1); !errors.Is(err, ErrNotLeader) {
+		t.Errorf("follower: got %v, want ErrNotLeader", err)
+	}
+	r.Kill()
+	if _, _, err := r.Propose(1); !errors.Is(err, ErrStopped) {
+		t.Errorf("killed node: got %v, want ErrStopped", err)
+	}
+}

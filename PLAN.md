@@ -96,6 +96,19 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
     教训：该变异不会让正常的收敛/进展检查失败（被冷落的 follower 会选举超时，系统靠换届自愈，只是性能变差），
     最初的"恢复后任期稳定"检查也抓不到，改为直接检查机制本身才有效。
 
+- [x] **10. 提案侧限流（对应 etcd 的 `MaxUncommittedEntriesSize`）**：
+  - 问题：客户端写入快于复制/提交时（例如被隔离的少数派 Leader），Leader 日志会无限增长。
+  - Leader 的"未提交条目数" = `len(log)-1-commitIndex`；`>= MaxUncommittedEntries`（默认 1024，`<= 0` 表示不限）时，
+    `propose` 拒绝并返回 `ErrProposalDropped`，不阻塞。Leader 当选时追加的 no-op 不受限。
+    用条目个数而非字节数：命令是 `interface{}`，大小不可知（etcd 用字节，因为它的条目是序列化后的字节串）。
+  - 新 API `Propose(cmd) (index, term, err)`，错误为 `ErrNotLeader` / `ErrProposalDropped` / `ErrStopped` /
+    `ErrNilCommand`；`Start` 保留为薄封装（第三个返回值现在表示"已接受"，不再只表示"是 Leader"）。
+  - 已知限制：从上一任期继承的未提交日志也计入，若超过上限，新 Leader 在它们提交前会拒绝所有提案。
+  - 验证：外壳测试（对端永不应答 → 恰好接受 `Max-1` 个后全部被拒；放行后恢复接受）；
+    模拟器把上限调小到 20，新增不变量"Leader 本任期的未提交条目 ≤ 上限+1（no-op）"，并要求扫描中确有提案被拒。
+    变异验证（去掉限流检查）：外壳测试立即失败（接受 50 个而非 9 个）；模拟器 300 个种子中仅 11 个检出——
+    模拟器对该功能的覆盖偏弱（约每 10 个种子才有 1 个触发拒绝），外壳测试才是主要保障。
+
 ## 与原指南的有意偏差（原因）
 
 1. **Ticker 用 10ms 轮询 + deadline，而不是 `time.Timer` 通道**：`Timer.Reset` 需要先 drain 通道，

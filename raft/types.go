@@ -1,7 +1,18 @@
 // Package raft is a from-scratch implementation of the Raft consensus protocol.
 package raft
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// Errors returned by Propose.
+var (
+	ErrNotLeader       = errors.New("raft: not the leader")
+	ErrProposalDropped = errors.New("raft: too many uncommitted entries, proposal dropped")
+	ErrStopped         = errors.New("raft: node stopped")
+	ErrNilCommand      = errors.New("raft: nil command is reserved for the leader no-op")
+)
 
 // Node roles.
 const (

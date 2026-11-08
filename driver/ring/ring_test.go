@@ -270,6 +270,35 @@ func TestUnblockAfterProducerDiedMidWrite(t *testing.T) {
 	}
 }
 
+// The dead producer was the newest one: nothing is behind its claim.
+func TestUnblockWhenTheDeadProducerWasTheLast(t *testing.T) {
+	for _, marker := range []bool{true, false} {
+		t.Run(fmt.Sprintf("marker=%v", marker), func(t *testing.T) {
+			r, b := newRing(t, 1024)
+			r.Write(1, []byte("before"))
+			idx := r.claim(40 + recordHeaderLen)
+			if marker {
+				b.PutInt32Ordered(idx, -int32(40+recordHeaderLen))
+			}
+			r.Read(func(int32, []byte) {}, 10)
+			if !r.Unblock() {
+				t.Fatal("Unblock did nothing")
+			}
+			if r.Read(func(int32, []byte) {}, 10) != 0 || r.Size() != 0 {
+				t.Fatalf("the hole was not consumed: size %d", r.Size())
+			}
+			if !r.Write(1, []byte("after")) {
+				t.Fatal("ring unusable after unblocking")
+			}
+			var got string
+			r.Read(func(_ int32, p []byte) { got = string(p) }, 10)
+			if got != "after" {
+				t.Fatalf("got %q", got)
+			}
+		})
+	}
+}
+
 func TestUnblockLeavesLiveRecordsAlone(t *testing.T) {
 	r, _ := newRing(t, 1024)
 	if r.Unblock() {

@@ -232,5 +232,12 @@ func (r *ManyToOne) Unblock() bool {
 			return true
 		}
 	}
+	// Nothing claimed behind it either: the dead producer's claim reaches the producer
+	// index (or the end of the data area), and it is all zero.
+	if limit > consumerIdx {
+		r.buf.PutInt32(consumerIdx+4, paddingType)
+		r.buf.PutInt32Ordered(consumerIdx, int32(limit-consumerIdx))
+		return true
+	}
 	return false
 }

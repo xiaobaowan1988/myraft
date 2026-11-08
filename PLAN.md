@@ -482,9 +482,22 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
       - 1 个存活变异：广播接收端读之前的 `valid` 预检被去掉，测试仍通过。分析后认为它是**行为等价**的：拷贝之后还有一次复核，被覆盖的数据同样会被丢弃并计入 lapped，预检只是少拷贝一次，不影响正确性，不再为它加测试。
       - 广播缓冲的"先拷贝、后复核"是有意的数据竞争（seqlock 式），**在 Go 堆内存上 `-race` 会报**；所以并发测试用 mmap 文件做缓冲（生产中也永远是 mmap），并在测试注释里说明。这也正是 `-race` 管不到共享内存的一个具体例子。
       - 多进程：4 个子进程（测试二进制自己 `exec`）向同一个 mmap 文件的环里各写 15000 条，父进程消费，逐生产者有序、无丢失、无损坏。
-    - [ ] **21.2 log buffer**：帧头、`Appender`、`Reader`、`Scanner`、term 切换与清理。
+    - [x] **21.2 log buffer**：帧头、`Appender`、`Reader`、`Scanner`、term 切换与清理。
       测试：多写者并发，每个写者的消息有序、总数不丢；写满一个 term 触发 padding 与切换，多轮循环（远超三个 term）后位置仍单调；
       读者永远不会读到半写的帧（压力测试里写者在写帧体中途被人为暂停）；分片消息重组；超过 `maxMessageLength` 被拒；`maxPayloadLength` 边界。
+      **21.2 结果**（`go vet`、`go test -race ./driver/...` 通过；`-race` 对堆内存上的 log buffer 有效，对 mmap 内存无效）：
+      - **与计划的偏离（实现中发现的缺陷，已改）**：
+        1. 计划写"对 tail 做原子 `Add` 抢占"。并发测试在 `-race` 下卡死后查明：发布者在"看到活动 term"与"抢占"之间被调度走足够久，分区已被回收给后面的 term，这时盲目的 `Add` 会给**别人的 term**的 tail 加上长度，留下永远没人发布的空洞，读者永远卡住。
+           改为**带 term id 的 CAS 循环**（tail 的高 32 位是 term id，过期的发布者 CAS 失败，返回 `AdminAction`，不碰别人的 tail）。Aeron 对这种情况是抛异常，视为不可能；Go 的调度器让它在小 term 下真的会发生，所以不能照搬。
+        2. 帧的"正在写"标记不再是 -1，而是**整个抢占区的长度取负**，这样 `Unblock` 知道要垫多大的 padding（零长度的情形才需要向后扫描）。
+        3. `Poll` 和 `Scan` 都校验帧头里的 term id，过期（上一轮使用该分区遗留）的帧一律当作"没有数据"。
+        4. `Unblock` 从 21.3 提前到这里（它是 log buffer 自己的操作）：覆盖"写了标记没发布""什么都没写""term 末尾的 padding 没写、也没轮转"，后者由 `Unblock` 完成轮转。
+      - **仍然成立的假设（写在包文档里）**：发布者写完已抢占的帧之前，其他发布者不会再填满两个 term（否则它的空间会被清零）；位置上限要留出"每个并发发布者最多多发一条最大消息"的余量，且不超过 `termLength/2`。term 为 MB 级时这意味着"毫秒内写完"，但这是**假设而不是保证**。
+      - **变异验证**（改坏后必须有测试失败，再恢复并 `diff`）：tail 抢占非原子、不写 padding、轮转不清零、轮转 CAS 去掉、不带 term id 的抢占、"正在写"标记写 -1、`Poll`/`Scan` 不校验 term id、位置上限不生效、`Unblock` 的标记情形空实现、`Unblock` 不完成轮转、`Scan` 带出 padding 整体、Assembler 交付孤立片段、Assembler 不在新 begin 时重置 → 全部被抓到。
+        中途发现 6 个最初**没被抓到**的（标记大小、term id 校验×2、`Unblock` 轮转、`Scan` padding、Assembler 无单测），逐一补了测试后再验证；其中"过期发布者的 claim"需要把日志停在 term 中间才能区分，第一版测试停在 term 末尾，变异仍然存活，改后才抓到。
+      - **存活的等价变异**：帧长度"从最后一帧到第一帧"发布，改成顺序发布，测试不变。分析：读者看到的只是更早出现的中间片段，由 Assembler 容纳，正确性不受影响；所以"整条消息一次性出现"只是一个不保证的优化，不为它加测试。
+      - 测试：往返与位置、帧头字段、分片边界（`maxPayload±1`、多片、大消息）、背压、跨 490 个 term 的轮转、term 末尾 padding、"发布前不可见"（含分片消息，钩子 `testBeforePublish`）、`Scan`、4 个发布者并发（2.4 万条跨数百个 term）、3 个**独立进程**发布者（1.5 万条）、各种空洞、过期 claim、Assembler。
+      - 测试环境的坑：变异失败时，子进程发布者会在父进程失败后继续跑最多 60 秒，占 CPU，让紧接着的变异测试看起来是"卡死/超时"。之后的变异运行用 `-timeout 40s` 并在每次后 `pkill`。
     - [ ] **21.3 Driver 骨架 + IPC 通道**：`MediaDriver` 启动/关闭、CnC 文件、Conductor、客户端库、IPC publication/subscription（同机不走 UDP）、`pub-lmt` 背压、客户端 keepalive 与超时回收、Driver 心跳。
       测试：同进程与跨进程的 IPC 收发（有序、恰好一次）；订阅者慢 → `BackPressured`，追上后恢复；客户端被杀 → Driver 回收其资源；Driver 被杀 → 客户端报错；多个 subscriber 的 `pub-lmt` 取最慢者。
     - [ ] **21.4 UDP 通道（无故障网络）**：`proto` 编解码、Sender、Receiver、Setup/StatusMessage 握手、image 创建、数据传输、流控窗口、分片重组。

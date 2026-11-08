@@ -16,6 +16,9 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
 | `raft/wal.go` | `Storage` 接口、`MemStorage`、`FileWAL`（追加写 + fsync + CRC） |
 | `raft/simnet.go` | 进程内模拟网络（异步消息）：丢包、重复、延迟乱序、分区、宕机、发送队列上限；单个调度协程 |
 | `raft/*_test.go` | 选举/复制/分区/持久化/混沌测试、WAL 单测 |
+| `stream/` | 阶段 18：通用可靠有序流（嵌入式库） |
+| `udpnet/` | 阶段 17/19：Raft 与 `stream` 之间的适配器 |
+| `driver/`、`cmd/mediadriver` | 阶段 21（计划中）：独立进程的 Media Driver、共享内存 log buffer、客户端库 |
 
 ## 阶段
 
@@ -425,6 +428,75 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
     - **测试中暴露的模型边界**：一个已向 leader 确认过的条目若在 follower 上因磁盘损坏而丢失，leader 的 matchIndex 只增不减，无法修复该 follower
       （与 etcd 相同）。这超出"fsync 之后数据不丢"的故障模型，测试按多数派（2/3）断言并在注释中说明，不是 bug 修复。
     - 仍无法验证：真实 fsync/掉电持久性、目录项持久性、磁盘乱序或谎报完成。
+
+- [ ] **21. Go 版 Media Driver（新包 `driver/`，对应 Aeron 的 Media Driver + Client；与阶段 18 的 `stream` 并行存在，不替换它）**：
+  - **动机**：`stream` 是嵌在应用进程里的库，数据要在应用缓冲、发送队列、UDP 之间多次拷贝，且传输逻辑与应用同生共死。
+    Aeron 的做法是把传输拆成独立的 Driver 进程，应用与 Driver 之间只用共享内存的 log buffer 交换数据。本阶段照这个架构做一个 Go 版。
+  - **范围（做）**：独立 Driver 进程（也可嵌入）；mmap 共享内存的 CnC 文件与 log buffer；Conductor / Sender / Receiver 三个 agent；
+    IPC 与 UDP 两种通道；单播；NAK 重传；接收窗口流控；分片与重组；客户端存活检测与 Driver 存活检测；Go 客户端库（`Publication` / `Subscription`）。
+  - **范围（不做，明确排除）**：与 Aeron 的线协议或文件格式**二进制兼容**（只借鉴形状，不求互通）；多播与 MDC；Archive；Cluster；
+    加密；Windows；可插拔拥塞控制（只做静态接收窗口）；第三方依赖（mmap、futex 之类一律用标准库 `syscall`）。
+  - **包结构**：
+
+    | 路径 | 内容 |
+    |---|---|
+    | `driver/shm` | mmap 文件封装（仅 linux，`//go:build linux`）、共享内存里的原子字段访问、`AtomicBuffer`（对一段共享内存的带边界检查的读写） |
+    | `driver/ring` | 到 Driver 的多生产者单消费者环形缓冲（`ManyToOneRingBuffer`，客户端命令）；到客户端的广播缓冲（`Broadcast`，Driver 事件） |
+    | `driver/logbuf` | log buffer：三个 term 分区 + 元数据；帧头；`Appender`（原子抢占空间写入）；`Reader`（顺序读已提交帧）；`Scanner`（Sender 用，按 MTU 取块） |
+    | `driver/counters` | 共享内存里的计数器区（位置、限制、统计），客户端只读 |
+    | `driver/proto` | UDP 帧格式（Data / Setup / StatusMessage / NAK / Heartbeat）与编解码 |
+    | `driver/` | `MediaDriver`、`Conductor`、`Sender`、`Receiver`、`IdleStrategy`、`Config` |
+    | `driver/client` | 客户端：`Connect(dir)`、`AddPublication`、`AddSubscription`、`Offer`、`Poll`、`Close` |
+    | `cmd/mediadriver` | 独立 Driver 进程的入口 |
+
+  - **关键设计**：
+    1. **CnC 文件**（command-and-control，Driver 目录下的 `cnc.dat`）：头（版本、各区长度、Driver 心跳时间戳、PID）+ 到 Driver 的 MPSC 环 + 到客户端的广播区 + 计数器区 + 错误日志区。
+       客户端命令（添加/删除 publication、subscription、客户端 keepalive）经 MPSC 环进入；Driver 的响应与事件（publication 就绪、image 出现/消失、错误）经广播区发出。
+    2. **log buffer 文件**：每个 publication / image 一个文件，`3 × termLength + 元数据`；`termLength` 为 2 的幂（默认 16 MiB，测试用 64 KiB）。
+       位置 `position = (termId - initialTermId) × termLength + termOffset`，`int64` 单调递增，寻址、重传、流控都用它。
+    3. **写入**：Publisher 对当前 term 的 `tail` 做原子 `Add` 抢占一段空间（多线程、多进程可并发），在自己抢到的区间写帧体和帧头，**最后用原子写帧长度来发布**；
+       读者读到帧长度为正才认为帧有效。抢占越过 term 末尾时，在剩余空间写填充帧（padding），并由抢到跨界的那个写者负责切换到下一个 term、清零再下一个 term（避免读到旧数据）。
+       帧对齐 32 字节；帧头 32 字节：`length(4) version(1) flags(1) type(2) termOffset(4) sessionId(4) streamId(4) termId(4) reserved(8)`。
+    4. **背压**：`Offer` 返回 `Offered(position)` / `BackPressured` / `NotConnected` / `AdminAction`（term 切换中，重试）/ `Closed` / `MaxPositionExceeded`；
+       发送上限由 Driver 的 Conductor 计算并写入 `pub-lmt` 计数器，客户端读它判断，不需要进 Driver。
+    5. **三个 agent，统一的 `DoWork(now) int` 工作周期**（返回做了多少工作，供 `IdleStrategy` 决定忙等 / `Gosched` / 退避睡眠）。
+       agent 内部只做一轮工作、不自己循环，所以测试里可以手动一步一步驱动，配合假时钟与假 socket，得到**确定性**测试（沿用阶段 7 的思路）。
+       真实运行时每个 agent 一个协程，可选 `runtime.LockOSThread`；`Config` 里提供 `DEDICATED`（3 协程）/ `SHARED`（1 协程）两种线程模式。
+    6. **单写者原则**：每个共享结构只有一个写者角色——`tail` 由 Publisher 们写，`sender position` 只由 Sender 写，`receiver position` / `HWM` 只由 Receiver 写，
+       `subscriber position` 只由对应 Subscriber 写，`pub-lmt` 只由 Conductor 写。每个计数器在文档里标明写者。
+    7. **UDP 协议**（只借鉴形状）：发送端周期发 `Setup`（session、stream、initialTermId、termLength、MTU）直到收到第一个 `StatusMessage`；
+       `Data` 帧携带 `termId/termOffset`，接收端据此**原位写入** image，乱序到达无需重排；缺口由 Receiver 发 `NAK(termId, offset, length)`，
+       发送端从 log buffer 原位重发；接收端周期发 `StatusMessage(consumptionPosition, window)`，发送端 `senderLimit = consumptionPosition + window`；
+       空闲时发送端发 `Heartbeat`（长度 0 的 Data 帧）携带当前位置，让接收端发现尾部丢失。NAK 与重传都带延迟/抑制，防止重复 NAK 引起风暴。
+    8. **存活检测**：客户端定期在 MPSC 环里写 keepalive，Driver 超时则回收该客户端的全部 publication / subscription；
+       Driver 定期更新 CnC 头里的心跳时间戳，客户端发现超时则 `Offer` / `Poll` 返回错误并要求重连。
+    9. **内存序**：Go 的 `sync/atomic` 是顺序一致的，强于 Aeron 用的 release/acquire，所以"先 copy 载荷、最后原子写帧长度"这一套在 Go 里是正确的（载荷 copy 对读者可见，当且仅当读者先看到帧长度）。
+       **`-race` 检测不到 mmap 内存上的竞态**（竞态检测器只跟踪 Go 堆），所以共享内存部分必须靠压力测试、不变量检查和多进程测试，不能指望 `-race`。
+  - **子步骤**（每一步：先改计划 → 写测试 → 实现 → 变异验证 → `gofmt`/`vet`/`test -race` → 提交推送；步骤之间不并行）：
+    - [ ] **21.1 共享内存基础**：`shm`（创建/打开/映射/清理文件，对齐检查）、`AtomicBuffer`、`ManyToOneRingBuffer`、`Broadcast`、计数器区。
+      测试：多协程并发写环并检查无丢失无重复、消息跨越环末尾（padding）、环满返回失败而不覆盖、广播接收者落后过多被明确告知（lapped）；
+      **多进程**：测试二进制自己 `exec` 子进程（`TestMain` + 环境变量切换角色）作为另一个进程写同一个文件。
+    - [ ] **21.2 log buffer**：帧头、`Appender`、`Reader`、`Scanner`、term 切换与清理。
+      测试：多写者并发，每个写者的消息有序、总数不丢；写满一个 term 触发 padding 与切换，多轮循环（远超三个 term）后位置仍单调；
+      读者永远不会读到半写的帧（压力测试里写者在写帧体中途被人为暂停）；分片消息重组；超过 `maxMessageLength` 被拒；`maxPayloadLength` 边界。
+    - [ ] **21.3 Driver 骨架 + IPC 通道**：`MediaDriver` 启动/关闭、CnC 文件、Conductor、客户端库、IPC publication/subscription（同机不走 UDP）、`pub-lmt` 背压、客户端 keepalive 与超时回收、Driver 心跳。
+      测试：同进程与跨进程的 IPC 收发（有序、恰好一次）；订阅者慢 → `BackPressured`，追上后恢复；客户端被杀 → Driver 回收其资源；Driver 被杀 → 客户端报错；多个 subscriber 的 `pub-lmt` 取最慢者。
+    - [ ] **21.4 UDP 通道（无故障网络）**：`proto` 编解码、Sender、Receiver、Setup/StatusMessage 握手、image 创建、数据传输、流控窗口、分片重组。
+      测试：编解码往返与畸形包（截断、错误长度、未知类型）不 panic；握手；收发有序、恰好一次；接收窗口被填满后发送端停止、订阅者消费后恢复；大消息跨多个 MTU；两个 stream、多个 session 互不串扰。
+    - [ ] **21.5 故障下的可靠性**：NAK、重传、重传抑制、心跳发现尾部丢失、重复包、乱序、迟到的订阅者（从当前位置加入而不是从头）、发送端或接收端 Driver 重启（session 变化）。
+      复用 `stream/testutil_test.go` 的 `faultConn` 思路（丢包、重复、乱序延迟），并用 **agent 手动驱动 + 假时钟**做确定性回放：给定种子，丢包 / 重复 / 乱序的序列固定，结果可复现。
+      不变量：每个 image 交给订阅者的字节流是发布者字节流的**前缀**，且最终完整；位置只增不减；`subscriber position ≤ receiver HWM`；`senderLimit` 从不被超过。
+    - [ ] **21.6 独立进程的端到端**：`cmd/mediadriver` 作为独立进程；测试里再起两个客户端进程（发布 / 订阅），经真实 UDP loopback 传输；
+      杀 Driver、杀客户端、重启后恢复；`-race` 之外再加长时间压力（数分钟、含故障注入）。
+    - [ ] **21.7 度量与诚实的对比**：基准测试（吞吐、往返延迟分位数）与 `stream` 对比，写入本计划。**只报测得的数字**，并说明测试环境（loopback、容器、CPU 数、无 CPU 绑定）；
+      不拿它与真实 Aeron 的数字作比较，也不声称接近 Aeron。
+  - **与已有部分的关系**：`stream` 与 `udpnet` 保持不动，Raft 仍跑在它们上面。21.7 之后是否把 Raft 的传输适配器迁到 Driver 之上（新的 `drivernet` 适配器），另开阶段 22 再定，不在本阶段内。
+  - **无法验证 / 必须如实说明的**：
+    1. 微秒级延迟与高吞吐：运行环境是共享容器的 loopback，Go 有 GC 与调度器，无法保证 CPU 绑定和无停顿，所以性能目标只做"测量并记录"，不设通过门槛；
+    2. 共享内存的正确性不受 `-race` 保护，依赖压力测试，**测试通过不等于证明无竞态**；
+    3. 真实多机网络（MTU 分片、交换机丢包、NAT）只在 loopback 上测过；
+    4. 进程崩溃时 log buffer 文件里半写的帧：Driver 只信任帧长度已发布的部分，但崩溃时 `tail` 已被抢占而帧未发布的"空洞"如何处理（Aeron 靠 publication 的 unblock 超时机制），在 21.3 里实现并测试，若做不到会在这里标注。
+  - **待确认的默认选择**（若有异议请在动手前提出，否则按此执行）：包名 `driver`；仅 linux；不与 Aeron 二进制兼容；步骤顺序为 共享内存 → log buffer → IPC → UDP → 故障 → 多进程 → 度量。
 
 ## 与原指南的有意偏差（原因）
 

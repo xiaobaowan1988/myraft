@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"fmt"
 	"math/rand"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -11,7 +13,9 @@ type cluster struct {
 	t      *testing.T
 	n      int
 	net    *SimNet
-	stores []*MemStorage
+	stores []*MemStorage // in-memory storage (when dir == "")
+	dir    string        // if set, every node keeps its state in a FileWAL in this directory
+	wals   []*crashingWAL
 
 	mu      sync.Mutex
 	rafts   []*Raft
@@ -21,15 +25,23 @@ type cluster struct {
 	global  map[int]interface{}   // index -> command, must never conflict
 }
 
-func newCluster(t *testing.T, n int) *cluster {
+func newCluster(t *testing.T, n int) *cluster { return newClusterIn(t, n, "") }
+
+// newFileCluster is a cluster whose nodes persist to real files, so a restarted node
+// recovers from what is on disk and nothing else.
+func newFileCluster(t *testing.T, n int) *cluster { return newClusterIn(t, n, t.TempDir()) }
+
+func newClusterIn(t *testing.T, n int, dir string) *cluster {
 	c := &cluster{
-		t: t, n: n, net: NewSimNet(n, time.Now().UnixNano()),
-		stores: make([]*MemStorage, n), rafts: make([]*Raft, n),
+		t: t, n: n, dir: dir, net: NewSimNet(n, time.Now().UnixNano()),
+		stores: make([]*MemStorage, n), wals: make([]*crashingWAL, n), rafts: make([]*Raft, n),
 		stops: make([]chan struct{}, n), alive: make([]bool, n),
 		applied: make([]map[int]interface{}, n), global: map[int]interface{}{},
 	}
 	for i := 0; i < n; i++ {
-		c.stores[i] = &MemStorage{}
+		if dir == "" {
+			c.stores[i] = &MemStorage{}
+		}
 		c.applied[i] = map[int]interface{}{}
 		c.start(i)
 	}
@@ -43,14 +55,48 @@ func newCluster(t *testing.T, n int) *cluster {
 }
 
 func (c *cluster) start(i int) {
+	if err := c.startErr(i); err != nil {
+		c.t.Fatalf("starting node %d: %v", i, err)
+	}
+}
+
+func (c *cluster) walPath(i int) string { return filepath.Join(c.dir, fmt.Sprintf("node%d.wal", i)) }
+
+func (c *cluster) wal(i int) *crashingWAL {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.wals[i]
+}
+
+// startErr (re)starts node i. With files, the node's applied history is wiped first:
+// a restarted node's state machine starts empty and must be rebuilt from its WAL.
+func (c *cluster) startErr(i int) error {
+	var st Storage
+	var cw *crashingWAL
+	if c.dir != "" {
+		w, err := OpenFileWAL(c.walPath(i))
+		if err != nil {
+			return err
+		}
+		cw = newCrashingWAL(w)
+		st = cw
+		c.mu.Lock()
+		c.applied[i] = map[int]interface{}{}
+		c.mu.Unlock()
+	} else {
+		st = c.stores[i]
+	}
 	applyCh := make(chan ApplyMsg, 16)
-	r, err := Make(i, c.n, c.net.Endpoint(i), c.stores[i], applyCh)
+	r, err := Make(i, c.n, c.net.Endpoint(i), st, applyCh)
 	if err != nil {
-		c.t.Fatalf("Make(%d): %v", i, err)
+		if cw != nil {
+			cw.Close()
+		}
+		return err
 	}
 	stop := make(chan struct{})
 	c.mu.Lock()
-	c.rafts[i], c.stops[i], c.alive[i] = r, stop, true
+	c.rafts[i], c.stops[i], c.alive[i], c.wals[i] = r, stop, true, cw
 	c.mu.Unlock()
 	c.net.Register(i, r)
 	c.net.SetUp(i, true)
@@ -73,6 +119,7 @@ func (c *cluster) start(i int) {
 			}
 		}
 	}()
+	return nil
 }
 
 func (c *cluster) crash(i int) {
@@ -82,11 +129,14 @@ func (c *cluster) crash(i int) {
 		return
 	}
 	c.alive[i] = false
-	r, stop := c.rafts[i], c.stops[i]
+	r, stop, wal := c.rafts[i], c.stops[i], c.wals[i]
 	c.mu.Unlock()
 	c.net.SetUp(i, false)
 	r.Kill()
 	close(stop)
+	if wal != nil {
+		wal.Close() // the file stays on disk, exactly as the crash left it
+	}
 }
 
 func (c *cluster) restart(i int) { c.start(i) }

@@ -3,6 +3,7 @@ package logbuf
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -733,5 +734,221 @@ func TestConnectedFlagIsSharedThroughTheMetadata(t *testing.T) {
 	a.SetConnected(false)
 	if b.IsConnected() {
 		t.Fatal("the flag was not cleared")
+	}
+}
+
+// --- the receiving side ---------------------------------------------------------
+
+func newPair(t *testing.T, termLength, mtu int) (pub, img *LogBuffer) {
+	t.Helper()
+	pub = newLog(t, termLength, mtu)
+	img = newLog(t, termLength, mtu) // same initial term id, session and stream (see newLog)
+	return
+}
+
+// transfer scans everything the publisher has from position `from` and returns the
+// datagrams a sender would put on the wire.
+func datagrams(pub *LogBuffer, from int64, maxLen int) (out []struct {
+	pos  int64
+	data []byte
+}) {
+	for {
+		frames, adv := pub.Scan(from, maxLen)
+		if adv == 0 {
+			return
+		}
+		out = append(out, struct {
+			pos  int64
+			data []byte
+		}{from, append([]byte(nil), frames...)})
+		from += int64(adv)
+	}
+}
+
+func TestInsertReproducesThePublishersLog(t *testing.T) {
+	pub, img := newPair(t, 1<<14, 256)
+	rd := newReader(img)
+	var sent int
+	for pub.Position() < 5*(1<<14) { // several terms, with padding at the ends
+		offer(t, pub, makeMsg(0, sent), noLimit)
+		sent++
+		// move what is there to the image, and let the image's reader keep up
+		if sent%7 == 0 {
+			for _, d := range datagrams(pub, rd.pos, 256) {
+				if _, err := img.Insert(d.pos, d.data); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rd.drain(t)
+			// what the driver's receiver does: once the reader is in term t, term t+1's
+			// partition (last used by term t-2) is cleaned for reuse
+			img.CleanTerm(int32(rd.pos>>img.termShift) + 1)
+		}
+	}
+	for _, d := range datagrams(pub, rd.pos, 256) {
+		img.Insert(d.pos, d.data)
+	}
+	rd.drain(t)
+	next := make([]int, 1)
+	for _, m := range rd.msgs {
+		verifyMsg(t, m, next)
+	}
+	if next[0] != sent {
+		t.Fatalf("the image delivered %d of %d messages", next[0], sent)
+	}
+	if rd.pos != pub.Position() {
+		t.Fatalf("image reader at %d, publisher at %d", rd.pos, pub.Position())
+	}
+}
+
+func TestInsertHandlesReorderingAndDuplicates(t *testing.T) {
+	pub, img := newPair(t, 1<<16, 256)
+	for i := 0; i < 60; i++ {
+		offer(t, pub, makeMsg(0, i), noLimit)
+	}
+	ds := datagrams(pub, 0, 256)
+	if len(ds) < 20 {
+		t.Fatalf("only %d datagrams", len(ds))
+	}
+	rd := newReader(img)
+	// deliver in a scrambled order with every datagram twice; the reader must see
+	// nothing past the first gap and everything once the gaps are filled
+	order := []int{}
+	for i := len(ds) - 1; i >= 1; i-- {
+		order = append(order, i, i)
+	}
+	for _, i := range order {
+		if _, err := img.Insert(ds[i].pos, ds[i].data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rd.poll(t) != 0 {
+		t.Fatal("the reader got data although the first datagram is missing")
+	}
+	img.Insert(ds[0].pos, ds[0].data)
+	img.Insert(ds[0].pos, ds[0].data)
+	rd.drain(t)
+	next := make([]int, 1)
+	for _, m := range rd.msgs {
+		verifyMsg(t, m, next)
+	}
+	if next[0] != 60 {
+		t.Fatalf("delivered %d of 60 messages", next[0])
+	}
+}
+
+func TestInsertRejectsBadFrames(t *testing.T) {
+	pub, img := newPair(t, 4096, 256)
+	offer(t, pub, []byte("hello"), noLimit)
+	good, _ := pub.Scan(0, 256)
+	good = append([]byte(nil), good...)
+
+	check := func(name string, pos int64, data []byte) {
+		t.Helper()
+		before := img.ContiguousEnd(0, 1<<20)
+		if _, err := img.Insert(pos, data); !errors.Is(err, ErrBadFrame) {
+			t.Errorf("%s: got %v, want ErrBadFrame", name, err)
+		}
+		if img.ContiguousEnd(0, 1<<20) != before {
+			t.Errorf("%s: a rejected datagram left a frame behind", name)
+		}
+	}
+	check("misaligned position", 8, good)
+	check("truncated header", 0, good[:20])
+	check("truncated payload", 0, good[:HeaderLength+2])
+	bad := append([]byte(nil), good...)
+	bad[0], bad[1], bad[2], bad[3] = 8, 0, 0, 0 // length below a header
+	check("length below the header size", 0, bad)
+	bad = append([]byte(nil), good...)
+	bad[20]++ // term id
+	check("wrong term id", 0, bad)
+	check("header says another offset", 64, good)
+	bad = append([]byte(nil), good...)
+	bad[0], bad[1], bad[2], bad[3] = 0, 0x10, 0, 0 // 4096 bytes: past the end of the term from offset 0 + more than present
+	check("length beyond the data", 0, bad)
+	if _, err := img.Insert(0, good); err != nil {
+		t.Fatalf("the good frame was rejected: %v", err)
+	}
+	if got := img.ContiguousEnd(0, 1<<20); got != 64 {
+		t.Fatalf("contiguous end %d, want 64", got)
+	}
+}
+
+// A padding frame arrives as just its header; the receiver's reader must skip the
+// whole padded space, including across the term boundary.
+func TestInsertPaddingFrame(t *testing.T) {
+	pub, img := newPair(t, 4096, 256)
+	rd := newReader(img)
+	for i := 0; i < 15; i++ {
+		offer(t, pub, make([]byte, 200), noLimit) // 232 -> 256 each: 3840
+	}
+	offer(t, pub, make([]byte, 100), noLimit) // 160: 4000, leaves 96
+	offer(t, pub, make([]byte, 150), noLimit) // 192 > 96 left: pads 96, goes to term 1
+	var padHeaderOnly bool
+	for _, d := range datagrams(pub, 0, 1<<12) {
+		if len(d.data) == HeaderLength && int(binary.LittleEndian.Uint32(d.data[0:4])) == 96 {
+			padHeaderOnly = true
+		}
+		if _, err := img.Insert(d.pos, d.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !padHeaderOnly {
+		t.Fatal("the padding frame did not travel as a header with the full padded length")
+	}
+	rd.drain(t)
+	if rd.pos != pub.Position() {
+		t.Fatalf("image reader at %d, publisher at %d", rd.pos, pub.Position())
+	}
+	if len(rd.msgs) != 17 {
+		t.Fatalf("got %d messages, want 17", len(rd.msgs))
+	}
+}
+
+func TestContiguousEndAndNextFrameAfter(t *testing.T) {
+	pub, img := newPair(t, 1<<14, 256)
+	for i := 0; i < 8; i++ {
+		offer(t, pub, make([]byte, 100), noLimit) // 160 bytes each
+	}
+	ds := datagrams(pub, 0, 160)
+	if len(ds) != 8 {
+		t.Fatalf("%d datagrams", len(ds))
+	}
+	for _, i := range []int{0, 1, 3, 4, 7} {
+		img.Insert(ds[i].pos, ds[i].data)
+	}
+	if got := img.ContiguousEnd(0, 8*160); got != 2*160 {
+		t.Fatalf("contiguous end %d, want %d", got, 2*160)
+	}
+	if got := img.NextFrameAfter(2*160, 8*160); got != 3*160 {
+		t.Fatalf("next frame after the first gap at %d, want %d", got, 3*160)
+	}
+	if got := img.ContiguousEnd(0, 3*160); got != 2*160 {
+		t.Fatalf("contiguous end with a limit: %d", got)
+	}
+	img.Insert(ds[2].pos, ds[2].data)
+	if got := img.ContiguousEnd(0, 8*160); got != 5*160 {
+		t.Fatalf("after filling the gap: %d, want %d", got, 5*160)
+	}
+	if got := img.NextFrameAfter(5*160, 8*160); got != 7*160 {
+		t.Fatalf("next frame after the second gap at %d, want %d", got, 7*160)
+	}
+	if got := img.NextFrameAfter(5*160, 6*160); got != 6*160 {
+		t.Fatalf("with no frame before the limit it should return the limit, got %d", got)
+	}
+}
+
+func TestCleanTerm(t *testing.T) {
+	l := newLog(t, 4096, 256)
+	l.Offer([]byte("x"), noLimit)
+	l.CleanTerm(0)
+	if _, n, _ := l.Poll(0, func([]byte, FrameInfo) {}, 10); n != 0 {
+		t.Fatal("a cleaned term still holds a frame")
+	}
+	// (term 3 uses the same partition as term 0)
+	l.Offer([]byte("y"), noLimit)
+	l.CleanTerm(3)
+	if _, n, _ := l.Poll(0, func([]byte, FrameInfo) {}, 10); n != 0 {
+		t.Fatal("CleanTerm(3) did not clean the partition term 0 uses")
 	}
 }

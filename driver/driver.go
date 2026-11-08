@@ -16,6 +16,8 @@ type MediaDriver struct {
 	cfg       Config
 	cnc       *cnc.File
 	conductor *Conductor
+	sender    *Sender
+	receiver  *Receiver
 	runners   []*runner
 	closeOnce sync.Once
 }
@@ -47,10 +49,12 @@ func Open(cfg Config) (*MediaDriver, error) {
 		f.Close()
 		return nil, err
 	}
+	snd, rcv := newSender(cfg), newReceiver(cfg)
+	cond.snd, cond.rcv, rcv.cond = snd, rcv, cond
 	cond.now, cond.lastHeartbeat = now, now
 	cond.cmds.SetConsumerHeartbeat(now)
 	f.Publish() // clients may attach from here on
-	return &MediaDriver{cfg: cfg, cnc: f, conductor: cond}, nil
+	return &MediaDriver{cfg: cfg, cnc: f, conductor: cond, sender: snd, receiver: rcv}, nil
 }
 
 // clearStale removes the previous contents of the directory, unless a live driver owns them.
@@ -81,9 +85,33 @@ func clearStale(cfg Config) error {
 	return nil
 }
 
-// Start runs the agents, each on its own goroutine.
+// Start runs the agents: one goroutine each (Dedicated), or one for all (Shared).
 func (d *MediaDriver) Start() {
-	d.runners = append(d.runners, startRunner(d.conductor, d.cfg.Idle(), d.cfg.Clock))
+	switch d.cfg.Threading {
+	case Shared:
+		d.runners = append(d.runners, startRunner(composite{d.conductor, d.sender, d.receiver}, d.cfg.Idle(), d.cfg.Clock))
+	default:
+		for _, a := range []Agent{d.conductor, d.sender, d.receiver} {
+			d.runners = append(d.runners, startRunner(a, d.cfg.Idle(), d.cfg.Clock))
+		}
+	}
+}
+
+// composite runs several agents in turn on one goroutine.
+type composite []Agent
+
+func (c composite) Name() string { return "shared" }
+func (c composite) DoWork(now int64) int {
+	n := 0
+	for _, a := range c {
+		n += a.DoWork(now)
+	}
+	return n
+}
+func (c composite) OnClose() {
+	for _, a := range c {
+		a.OnClose()
+	}
 }
 
 // Launch is Open followed by Start.
@@ -99,6 +127,10 @@ func Launch(cfg Config) (*MediaDriver, error) {
 // Conductor returns the control-plane agent, for tests that drive it by hand.
 func (d *MediaDriver) Conductor() *Conductor { return d.conductor }
 
+// Sender and Receiver return the data-plane agents (their Stats are safe to read at any time).
+func (d *MediaDriver) Sender() *Sender     { return d.sender }
+func (d *MediaDriver) Receiver() *Receiver { return d.receiver }
+
 // Dir returns the driver directory clients connect to.
 func (d *MediaDriver) Dir() string { return d.cfg.Dir }
 
@@ -110,6 +142,8 @@ func (d *MediaDriver) Close() error {
 		for _, r := range d.runners {
 			r.close()
 		}
+		d.sender.OnClose()
+		d.receiver.OnClose()
 		d.conductor.OnClose()
 		err = d.cnc.Close()
 		if d.cfg.DeleteDirOnClose {

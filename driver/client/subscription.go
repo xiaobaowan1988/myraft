@@ -20,6 +20,7 @@ type Subscription struct {
 	c      *Client
 	regID  int64
 	stream int32
+	local  string
 
 	mu     sync.RWMutex // held for reading by Poll, for writing to change images or unmap
 	closed bool
@@ -43,7 +44,7 @@ type Image struct {
 // each publication has reached when the two are linked: earlier messages are not seen.
 func (c *Client) AddSubscription(channel string, stream int32) (*Subscription, error) {
 	v, err := c.request(cnc.Command{Type: cnc.CmdAddSubscription, StreamID: stream, Channel: channel}, func(ev cnc.Event) (any, error) {
-		s := &Subscription{c: c, regID: ev.CorrelationID, stream: stream}
+		s := &Subscription{c: c, regID: ev.CorrelationID, stream: stream, local: ev.Name}
 		c.subs[s.regID] = s // registered before any image event is handled
 		return s, nil
 	})
@@ -89,6 +90,10 @@ func (s *Subscription) removeImage(id int64) {
 		}
 	}
 }
+
+// LocalAddr is the address a UDP subscription is bound to (useful when it asked for
+// port 0); empty for IPC.
+func (s *Subscription) LocalAddr() string { return s.local }
 
 // ImageCount is the number of publications this subscription is attached to.
 func (s *Subscription) ImageCount() int {

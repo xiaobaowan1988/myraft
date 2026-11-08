@@ -556,3 +556,95 @@ func (l *LogBuffer) SimulateDeadPublisher(size int, writeMarker bool) Status {
 		return st
 	}
 }
+
+// ErrBadFrame reports a received datagram that is not a sequence of well-formed
+// frames for the position it claims.
+var ErrBadFrame = errors.New("logbuf: bad frame in received data")
+
+// Insert writes the frames of a received datagram into the log at position, as the
+// receiving side of a stream does. The bytes are exactly what Scan returned on the
+// sending side: whole frames, the last possibly a padding frame of which only the
+// header is present (its length field says how much space it covers).
+//
+// Each frame is validated before anything of it is written, copied without its
+// length, and published by storing the length last, so readers never see a partial
+// frame. A frame that is already there (its length is set) is left alone, which makes
+// duplicates harmless; it also means the caller must clean (CleanTerm) a partition
+// before a later term is written into it. It returns the position after the last frame. On error the
+// frames before the bad one stay inserted.
+func (l *LogBuffer) Insert(position int64, data []byte) (int64, error) {
+	if position&(FrameAlign-1) != 0 {
+		return position, fmt.Errorf("%w: position %d is not frame aligned", ErrBadFrame, position)
+	}
+	for cur := 0; cur < len(data); {
+		if len(data)-cur < HeaderLength {
+			return position, fmt.Errorf("%w: %d bytes left, less than a header", ErrBadFrame, len(data)-cur)
+		}
+		length := int(int32(le32(data[cur:])))
+		_, typ := parseVerFlType(int32(le32(data[cur+offVerFlType:])))
+		onWire := length // bytes of this frame present in data
+		if typ == TypePad {
+			onWire = HeaderLength
+		}
+		termCount := int32(position >> l.termShift)
+		termID := l.initialTermID + termCount
+		off := int(position & int64(l.termLength-1))
+		switch {
+		case length < HeaderLength || cur+onWire > len(data):
+			return position, fmt.Errorf("%w: frame of length %d with %d bytes available", ErrBadFrame, length, len(data)-cur)
+		case off+align(length) > l.termLength:
+			return position, fmt.Errorf("%w: frame of %d bytes at term offset %d crosses the end of the term", ErrBadFrame, length, off)
+		case int32(le32(data[cur+offTermID:])) != termID || int(int32(le32(data[cur+offTermOff:]))) != off:
+			return position, fmt.Errorf("%w: frame header does not match position %d", ErrBadFrame, position)
+		}
+		t := l.terms[l.partitionOf(termCount)]
+		if t.Int32Volatile(off+offLength) == 0 {
+			t.PutBytes(off+4, data[cur+4:cur+onWire])
+			t.PutInt32Ordered(off+offLength, int32(length))
+		}
+		cur += align(onWire)
+		position += int64(align(length))
+	}
+	return position, nil
+}
+
+func le32(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+
+// ContiguousEnd returns the position up to which frames are present without a gap,
+// starting from `from` (a frame boundary) and looking no further than limit.
+func (l *LogBuffer) ContiguousEnd(from, limit int64) int64 {
+	pos := from
+	for pos < limit {
+		termCount := int32(pos >> l.termShift)
+		t := l.terms[l.partitionOf(termCount)]
+		off := int(pos & int64(l.termLength-1))
+		length := int(t.Int32Volatile(off + offLength))
+		if length < HeaderLength || off+length > l.termLength || t.Int32(off+offTermID) != l.initialTermID+termCount {
+			break
+		}
+		pos += int64(align(length))
+	}
+	return pos
+}
+
+// NextFrameAfter returns the position of the first frame present after from, looking
+// no further than limit, or limit if there is none: the end of a gap that starts at from.
+func (l *LogBuffer) NextFrameAfter(from, limit int64) int64 {
+	for pos := from + FrameAlign; pos < limit; pos += FrameAlign {
+		termCount := int32(pos >> l.termShift)
+		t := l.terms[l.partitionOf(termCount)]
+		off := int(pos & int64(l.termLength-1))
+		if t.Int32Volatile(off+offLength) > 0 {
+			return pos
+		}
+	}
+	return limit
+}
+
+// CleanTerm zeroes the partition that holds term number termCount (counted from the
+// initial term) so it can receive a later term.
+func (l *LogBuffer) CleanTerm(termCount int32) {
+	l.terms[l.partitionOf(termCount)].Zero(0, l.termLength)
+}

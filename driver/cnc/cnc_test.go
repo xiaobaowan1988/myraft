@@ -30,6 +30,7 @@ func TestEventRoundTrip(t *testing.T) {
 		{Type: EvAvailableImage, CorrelationID: 2, RegistrationID: 3, SessionID: 4, StreamID: 5, CounterID: 6, Name: "x"},
 		{Type: EvUnavailableImage, CorrelationID: 8, RegistrationID: 9, StreamID: 10},
 		{Type: EvOperationSuccess, CorrelationID: 11},
+		{Type: EvOperationSuccess, CorrelationID: 12, Name: "127.0.0.1:4000"},
 		{Type: EvError, CorrelationID: 12, Code: ErrCodeInvalidChannel, Message: "no such channel"},
 	} {
 		got, err := DecodeEvent(e.Type, EncodeEvent(e))

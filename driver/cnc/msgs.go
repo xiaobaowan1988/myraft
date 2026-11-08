@@ -104,7 +104,7 @@ type Event struct {
 	SessionID      int32
 	StreamID       int32
 	CounterID      int32  // pub-lmt (publication ready) or the subscriber position (image)
-	Name           string // log file name relative to the driver directory
+	Name           string // log file name relative to the driver directory; for a subscription's OperationSuccess, the address it is bound to
 	Code           int32
 	Message        string
 }
@@ -124,6 +124,9 @@ func EncodeEvent(e Event) []byte {
 	case EvUnavailableImage:
 		b = le.AppendUint64(b, uint64(e.RegistrationID))
 		b = le.AppendUint32(b, uint32(e.StreamID))
+	case EvOperationSuccess:
+		b = le.AppendUint32(b, uint32(len(e.Name)))
+		b = append(b, e.Name...)
 	case EvError:
 		b = le.AppendUint32(b, uint32(e.Code))
 		b = le.AppendUint32(b, uint32(len(e.Message)))
@@ -170,7 +173,16 @@ func DecodeEvent(typ int32, b []byte) (Event, error) {
 			return e, errShort
 		}
 		e.Message = string(rest[8 : 8+n])
-	case EvOperationSuccess, EvSubscriptionReady:
+	case EvOperationSuccess:
+		if len(rest) < 4 {
+			return e, errShort
+		}
+		n := int(le.Uint32(rest))
+		if n < 0 || len(rest)-4 < n {
+			return e, errShort
+		}
+		e.Name = string(rest[4 : 4+n])
+	case EvSubscriptionReady:
 	default:
 		return e, errors.New("cnc: unknown event type")
 	}

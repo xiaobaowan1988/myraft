@@ -172,12 +172,18 @@ func pollUntil(t testing.TB, s *Subscription, h Handler, done func() bool, what 
 		}
 		if n == 0 {
 			if time.Now().After(deadline) {
+				if stallDump != nil {
+					stallDump(t)
+				}
 				t.Fatalf("timed out waiting for %s", what)
 			}
 			time.Sleep(20 * time.Microsecond)
 		}
 	}
 }
+
+// stallDump, when set by a test fixture, logs the state of the system when a poll times out.
+var stallDump func(t testing.TB)
 
 func waitConnected(t *testing.T, p *Publication) {
 	t.Helper()
@@ -372,7 +378,7 @@ func TestDriverRejectsBadRequests(t *testing.T) {
 	d := launch(t, nil)
 	c := connect(t, d, nil)
 	var de *DriverError
-	if _, err := c.AddPublication("udp://127.0.0.1:1", 1); !errors.As(err, &de) || de.Code != cnc.ErrCodeInvalidChannel {
+	if _, err := c.AddPublication("tcp://127.0.0.1:1", 1); !errors.As(err, &de) || de.Code != cnc.ErrCodeInvalidChannel {
 		t.Fatalf("an unsupported channel gave %v, want an invalid-channel DriverError", err)
 	}
 	if _, err := c.AddSubscription("nonsense", 1); !errors.As(err, &de) || de.Code != cnc.ErrCodeInvalidChannel {

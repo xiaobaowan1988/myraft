@@ -56,6 +56,10 @@ type Config struct {
 	StatusInterval       time.Duration // a receiver reports its position at least this often; default 10ms
 	ReceiverTimeout      time.Duration // a sender that hears no Status for this long considers the receiver gone; default 5s
 	ImageLivenessTimeout time.Duration // an image that hears nothing from its sender for this long is drained and closed; default 10s
+	NakDelay             time.Duration // a gap must persist this long before it is NAKed, to ride out reordering; default 2ms
+	NakRetryInterval     time.Duration // first NAK repeat interval, doubled each time up to 200ms; default 20ms
+	RetransmitLinger     time.Duration // repeated NAKs for the same range within this time are ignored; default 20ms
+	MaxRetransmits       int           // concurrent retransmissions a sender serves; default 16
 
 	Threading ThreadingMode
 	// ListenPacket opens datagram sockets; default ListenUDP. Tests substitute an
@@ -102,6 +106,10 @@ func (c *Config) setDefaults() error {
 	deft(&c.DriverTimeout, 10*time.Second)
 	deft(&c.UnblockTimeout, 10*time.Second)
 	deft(&c.Linger, 5*time.Second)
+	deft(&c.NakDelay, 2*time.Millisecond)
+	deft(&c.NakRetryInterval, 20*time.Millisecond)
+	deft(&c.RetransmitLinger, 20*time.Millisecond)
+	def(&c.MaxRetransmits, 16)
 	deft(&c.SetupInterval, 50*time.Millisecond)
 	deft(&c.HeartbeatInterval, 100*time.Millisecond)
 	deft(&c.StatusInterval, 10*time.Millisecond)

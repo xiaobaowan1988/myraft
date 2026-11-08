@@ -42,6 +42,9 @@ type Options struct {
 	// handles driver events and sends keepalives. The caller drives DoWork instead
 	// (requests also drive it while they wait).
 	ManualConductor bool
+	// Pump, if set, is called each time a request waits for the driver's answer. A
+	// test that runs the driver by hand uses it to advance the whole simulation.
+	Pump func()
 }
 
 // Client is a connection to a media driver. It is safe for concurrent use.
@@ -257,6 +260,9 @@ func (c *Client) request(cmd cnc.Command, build func(cnc.Event) (any, error)) (a
 	}
 	deadline := time.Now().Add(c.opts.ResourceTimeout)
 	for {
+		if c.opts.Pump != nil {
+			c.opts.Pump()
+		}
 		if c.opts.ManualConductor {
 			c.DoWork()
 		}

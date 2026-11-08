@@ -16,7 +16,7 @@ const (
 
 // ReceiverStats counts what the receiver has done.
 type ReceiverStats struct {
-	DatagramsReceived, FramesInserted, Dropped, Malformed, StatusSent, ImagesRequested int64
+	DatagramsReceived, FramesInserted, Dropped, Malformed, StatusSent, ImagesRequested, NaksSent int64
 }
 
 type imgKey struct{ session, stream int32 }
@@ -53,6 +53,10 @@ type recvImage struct {
 	statusSent   bool
 	cleaned      int32
 	inactive     bool
+	nakGapStart  int64 // the gap being NAKed, or -1
+	gapSince     int64
+	lastNak      int64
+	nakInterval  int64
 	termShift    uint
 	initialTerm  int32
 }
@@ -80,6 +84,7 @@ func (r *Receiver) Stats() ReceiverStats {
 		DatagramsReceived: atomic.LoadInt64(&r.st.DatagramsReceived), FramesInserted: atomic.LoadInt64(&r.st.FramesInserted),
 		Dropped: atomic.LoadInt64(&r.st.Dropped), Malformed: atomic.LoadInt64(&r.st.Malformed),
 		StatusSent: atomic.LoadInt64(&r.st.StatusSent), ImagesRequested: atomic.LoadInt64(&r.st.ImagesRequested),
+		NaksSent: atomic.LoadInt64(&r.st.NaksSent),
 	}
 }
 
@@ -124,6 +129,7 @@ func (r *Receiver) registerImage(epID int64, h imageHandle, now int64) {
 	img := &recvImage{imageHandle: h, hwm: h.joinPos, rebuild: h.joinPos, lastActivity: now,
 		termShift: uint(log2(h.log.TermLength())), initialTerm: h.log.InitialTermID()}
 	img.cleaned = int32(h.joinPos >> img.termShift)
+	img.nakGapStart = -1
 	ep.images[h.key] = img
 	h.hwmC.Set(h.joinPos)
 	h.rcvPosC.Set(h.joinPos)
@@ -209,6 +215,7 @@ func (r *Receiver) onSetup(ep *recvEndpoint, b []byte, from netip.AddrPort, now 
 	if img := ep.images[key]; img != nil {
 		if sameAddr(img.src, from) {
 			img.lastActivity = now
+			img.lastStatus = 0 // the sender is still waiting for an answer: our Status may have been lost
 		}
 		return
 	}
@@ -287,6 +294,7 @@ func (r *Receiver) serviceImage(ep *recvEndpoint, key imgKey, img *recvImage, no
 		img.cleaned = tc
 		work++
 	}
+	work += r.detectLoss(ep, key, img, now)
 	if !img.inactive && now-img.lastActivity > int64(r.cfg.ImageLivenessTimeout) {
 		img.inactive = true
 		epID := ep.id
@@ -304,4 +312,45 @@ func (r *Receiver) serviceImage(ep *recvEndpoint, key imgKey, img *recvImage, no
 		}
 	}
 	return work
+}
+
+const maxNakInterval = int64(200e6) // 200ms
+
+// detectLoss NAKs the gap in front of the contiguous position. A gap exists when the
+// highest position seen (data, or the sender's position from a heartbeat) is beyond
+// the contiguous one. It ends at the next frame that did arrive, or at the highest
+// position when nothing after it did (loss at the tail). A NAK covers one term.
+func (r *Receiver) detectLoss(ep *recvEndpoint, key imgKey, img *recvImage, now int64) int {
+	if img.inactive || img.hwm <= img.rebuild {
+		img.nakGapStart = -1
+		return 0
+	}
+	start := img.rebuild
+	if start != img.nakGapStart { // a new gap, or the old one got shorter: wait before asking
+		img.nakGapStart, img.gapSince, img.lastNak = start, now, 0
+		img.nakInterval = int64(r.cfg.NakRetryInterval)
+	}
+	if img.lastNak == 0 {
+		if now-img.gapSince < int64(r.cfg.NakDelay) {
+			return 0
+		}
+	} else if now-img.lastNak < img.nakInterval {
+		return 0
+	}
+	end := img.log.NextFrameAfter(start, img.hwm)
+	if termEnd := (start>>img.termShift + 1) << img.termShift; end > termEnd {
+		end = termEnd
+	}
+	b := proto.EncodeNak(proto.Nak{SessionID: key.session, StreamID: key.stream,
+		TermID: img.initialTerm + int32(start>>img.termShift), TermOffset: int32(start & int64(img.log.TermLength()-1)), Length: int32(end - start)})
+	sent, err := ep.conn.Send(b, img.src)
+	if err != nil || !sent {
+		return 0
+	}
+	img.lastNak = now
+	if img.nakInterval *= 2; img.nakInterval > maxNakInterval {
+		img.nakInterval = maxNakInterval
+	}
+	atomic.AddInt64(&r.st.NaksSent, 1)
+	return 1
 }

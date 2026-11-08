@@ -131,6 +131,9 @@ func (d *MediaDriver) Conductor() *Conductor { return d.conductor }
 func (d *MediaDriver) Sender() *Sender     { return d.sender }
 func (d *MediaDriver) Receiver() *Receiver { return d.receiver }
 
+// Config returns the configuration the driver runs with, defaults filled in.
+func (d *MediaDriver) Config() Config { return d.cfg }
+
 // Dir returns the driver directory clients connect to.
 func (d *MediaDriver) Dir() string { return d.cfg.Dir }
 

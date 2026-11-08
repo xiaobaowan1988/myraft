@@ -18,6 +18,7 @@ const (
 // SenderStats counts what the sender has done. Read it with atomic loads via Snapshot.
 type SenderStats struct {
 	DatagramsSent, BytesSent, HeartbeatsSent, SetupsSent, StatusReceived, Malformed, SendBlocked int64
+	NaksReceived, NaksRejected, NaksSuppressed, RetransmitDatagrams                              int64
 }
 
 // senderPub is the sender's state for one network publication. After the conductor
@@ -43,6 +44,14 @@ type senderPub struct {
 	lastSetup   int64
 	lastSend    int64
 	started     bool
+	retrans     []*retransmit
+}
+
+// retransmit is a range the receiver asked for again. It is kept after it has been
+// sent, for RetransmitLinger, so that NAKs repeating the request are recognised.
+type retransmit struct {
+	from, end, next int64
+	touched         int64
 }
 
 // Sender is the agent that moves published data from log buffers onto the network
@@ -65,7 +74,9 @@ func (s *Sender) Stats() SenderStats {
 		DatagramsSent: atomic.LoadInt64(&s.st.DatagramsSent), BytesSent: atomic.LoadInt64(&s.st.BytesSent),
 		HeartbeatsSent: atomic.LoadInt64(&s.st.HeartbeatsSent), SetupsSent: atomic.LoadInt64(&s.st.SetupsSent),
 		StatusReceived: atomic.LoadInt64(&s.st.StatusReceived), Malformed: atomic.LoadInt64(&s.st.Malformed),
-		SendBlocked: atomic.LoadInt64(&s.st.SendBlocked),
+		SendBlocked: atomic.LoadInt64(&s.st.SendBlocked), NaksReceived: atomic.LoadInt64(&s.st.NaksReceived),
+		NaksRejected: atomic.LoadInt64(&s.st.NaksRejected), NaksSuppressed: atomic.LoadInt64(&s.st.NaksSuppressed),
+		RetransmitDatagrams: atomic.LoadInt64(&s.st.RetransmitDatagrams),
 	}
 }
 
@@ -103,6 +114,7 @@ func (s *Sender) DoWork(now int64) int {
 		work += s.receiveControl(sp, now)
 		if sp.connected && now-sp.lastStatus > int64(s.cfg.ReceiverTimeout) {
 			sp.connected = false // the receiver went away: stop sending until a new Setup is answered
+			sp.retrans = nil
 			sp.log.SetConnected(false)
 			work++
 		}
@@ -112,6 +124,7 @@ func (s *Sender) DoWork(now int64) int {
 			}
 			continue
 		}
+		work += s.sendRetransmits(sp, now)
 		work += s.sendData(sp, now)
 	}
 	return work
@@ -142,8 +155,14 @@ func (s *Sender) receiveControl(sp *senderPub, now int64) int {
 				continue
 			}
 			s.onStatus(sp, st, now)
+		case proto.TypeNak:
+			nak, err := proto.ParseNak(s.buf[:n])
+			if err != nil || nak.SessionID != sp.session || nak.StreamID != sp.stream {
+				incr(&s.st.Malformed)
+				continue
+			}
+			s.onNak(sp, nak, now)
 		default:
-			// NAK handling arrives in stage 21.5; anything else is not for a sender.
 			incr(&s.st.Malformed)
 		}
 	}
@@ -173,6 +192,68 @@ func (s *Sender) onStatus(sp *senderPub, st proto.Status, now int64) {
 		sp.senderLimit = lim
 		sp.limC.Set(lim)
 	}
+}
+
+// onNak queues a retransmission. A request is refused unless it names data the
+// sender has sent and the receiver still needs (and so is still in the log), starting
+// at a frame boundary; one that repeats a range already being served is suppressed.
+func (s *Sender) onNak(sp *senderPub, n proto.Nak, now int64) {
+	incr(&s.st.NaksReceived)
+	if n.TermOffset < 0 || int(n.TermOffset) >= sp.termLength || n.TermOffset%logbuf.FrameAlign != 0 || int(n.Length) > sp.termLength {
+		incr(&s.st.NaksRejected)
+		return
+	}
+	from := int64(n.TermID-sp.initialTerm)<<sp.termShift + int64(n.TermOffset)
+	if from < 0 || from < sp.consumption || from >= sp.senderPos || !sp.connected {
+		incr(&s.st.NaksRejected)
+		return
+	}
+	end := min(from+int64(n.Length), sp.senderPos)
+	for _, r := range sp.retrans {
+		if from >= r.from && from < r.end && now-r.touched < int64(s.cfg.RetransmitLinger) {
+			incr(&s.st.NaksSuppressed)
+			return
+		}
+	}
+	if len(sp.retrans) >= s.cfg.MaxRetransmits {
+		incr(&s.st.NaksRejected)
+		return
+	}
+	sp.retrans = append(sp.retrans, &retransmit{from: from, end: end, next: from, touched: now})
+}
+
+// sendRetransmits serves the queued ranges, a few datagrams per cycle.
+func (s *Sender) sendRetransmits(sp *senderPub, now int64) int {
+	work, budget := 0, 8
+	keep := sp.retrans[:0]
+	for _, r := range sp.retrans {
+		for r.next < r.end && budget > 0 {
+			// Never past r.end: the log holds frames beyond what has been sent (publishers
+			// write ahead of the sender), and sending those now would ignore the flow-control
+			// window and make the receiver report a position the sender never reached.
+			frames, adv := sp.log.Scan(r.next, int(min(int64(sp.mtu), r.end-r.next)))
+			if adv == 0 {
+				r.next = r.end // nothing that fits there: give the request up (the receiver asks again)
+				break
+			}
+			sent, err := sp.conn.Send(frames, sp.dest)
+			if err != nil || !sent {
+				incr(&s.st.SendBlocked)
+				budget = 0
+				break
+			}
+			r.next += int64(adv)
+			r.touched = now
+			budget--
+			work++
+			incr(&s.st.RetransmitDatagrams)
+		}
+		if r.next < r.end || now-r.touched < int64(s.cfg.RetransmitLinger) {
+			keep = append(keep, r)
+		}
+	}
+	sp.retrans = keep
+	return work
 }
 
 func (s *Sender) sendSetup(sp *senderPub, now int64) int {

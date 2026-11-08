@@ -4,17 +4,18 @@ import (
 	"math/rand"
 	"net"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/xiaobaowan1988/myraft/raft"
+	"github.com/xiaobaowan1988/myraft/stream"
 )
 
 var testKey = []byte("0123456789abcdef-test-key")
 
 // recorder is a raft.Endpoint that remembers what it was given.
 type recorder struct {
+	block       chan struct{} // if non-nil, Step waits for it to be closed
 	mu          sync.Mutex
 	msgs        []raft.Message
 	unreachable []int
@@ -22,7 +23,20 @@ type recorder struct {
 
 func (r *recorder) Step(m raft.Message) {
 	r.mu.Lock()
+	block := r.block
+	r.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+	r.mu.Lock()
 	r.msgs = append(r.msgs, m)
+	r.mu.Unlock()
+}
+
+// setBlock makes Step wait until ch is closed (nil removes the block).
+func (r *recorder) setBlock(ch chan struct{}) {
+	r.mu.Lock()
+	r.block = ch
 	r.mu.Unlock()
 }
 
@@ -59,16 +73,9 @@ type faultConn struct {
 	drop     float64
 	dup      float64
 	maxDelay time.Duration
-	written  atomic.Int64
-	dropped  atomic.Int64
-}
-
-func newFaultConn(c *net.UDPConn, seed int64, drop, dup float64, maxDelay time.Duration) *faultConn {
-	return &faultConn{UDPConn: c, rng: rand.New(rand.NewSource(seed)), drop: drop, dup: dup, maxDelay: maxDelay}
 }
 
 func (f *faultConn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
-	f.written.Add(1)
 	pkt := append([]byte(nil), b...)
 	f.mu.Lock()
 	lost := f.rng.Float64() < f.drop
@@ -84,7 +91,6 @@ func (f *faultConn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
 	}
 	f.mu.Unlock()
 	if lost {
-		f.dropped.Add(1)
 		return len(b), nil
 	}
 	for _, d := range delays {
@@ -103,17 +109,9 @@ func listen(t *testing.T) *net.UDPConn {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.SetReadBuffer(4 << 20) // like New does for sockets it creates itself
+	c.SetReadBuffer(4 << 20)
 	c.SetWriteBuffer(4 << 20)
 	return c
-}
-
-// testNet is n transports on loopback sockets that know each other.
-type testNet struct {
-	tr    []*Transport
-	rec   []*recorder
-	conns []*net.UDPConn
-	fault []*faultConn // nil entries when no faults
 }
 
 type netOpts struct {
@@ -122,28 +120,36 @@ type netOpts struct {
 	tweak     func(i int, c *Config)
 }
 
+// wrap applies the fault model to a socket.
+func (o netOpts) wrap(c *net.UDPConn, seed int64) stream.PacketConn {
+	if o.drop > 0 || o.dup > 0 || o.maxDelay > 0 {
+		return &faultConn{UDPConn: c, rng: rand.New(rand.NewSource(seed)), drop: o.drop, dup: o.dup, maxDelay: o.maxDelay}
+	}
+	return c
+}
+
+// testNet is n transports on loopback sockets that know each other.
+type testNet struct {
+	tr    []*Transport
+	rec   []*recorder
+	conns []*net.UDPConn
+	addrs []string
+}
+
 func newTestNet(t *testing.T, n int, o netOpts) *testNet {
 	t.Helper()
 	tn := &testNet{}
-	addrs := make([]string, n)
 	for i := 0; i < n; i++ {
 		c := listen(t)
 		tn.conns = append(tn.conns, c)
-		addrs[i] = c.LocalAddr().String()
+		tn.addrs = append(tn.addrs, c.LocalAddr().String())
 	}
 	for i := 0; i < n; i++ {
-		var pc PacketConn = tn.conns[i]
-		var fc *faultConn
-		if o.drop > 0 || o.dup > 0 || o.maxDelay > 0 {
-			fc = newFaultConn(tn.conns[i], int64(100+i), o.drop, o.dup, o.maxDelay)
-			pc = fc
-		}
-		tn.fault = append(tn.fault, fc)
-		cfg := Config{ID: i, Peers: addrs, Key: testKey, Conn: pc}
+		cfg := Config{ID: i, Peers: tn.addrs, Key: testKey, Conn: o.wrap(tn.conns[i], int64(100+i))}
 		if o.tweak != nil {
 			o.tweak(i, &cfg)
 		}
-		tr, err := New(cfg)
+		tr, err := New(cfg, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,9 +175,4 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-}
-
-// small is a tiny message carrying i in Seq, for ordering checks.
-func small(from, to int, i uint64) raft.Message {
-	return raft.Message{Type: raft.MsgAppResp, From: from, To: to, Term: 1, Seq: i, Success: true, Match: int(i)}
 }

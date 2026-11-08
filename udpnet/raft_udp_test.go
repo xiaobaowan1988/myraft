@@ -2,6 +2,7 @@ package udpnet
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,9 +29,10 @@ type raftNode struct {
 
 func newRaftCluster(t *testing.T, n int, o netOpts) *raftCluster {
 	t.Helper()
-	oldBytes := raft.MaxAppendBytes
-	raft.MaxAppendBytes = 4096 // datagram transports want small batches
-	t.Cleanup(func() { raft.MaxAppendBytes = oldBytes })
+	// On a reliable stream raft.AppendTimeout is only a safety net: see the package doc.
+	oldTimeout := raft.AppendTimeout
+	raft.AppendTimeout = 10 * time.Second
+	t.Cleanup(func() { raft.AppendTimeout = oldTimeout })
 
 	c := &raftCluster{t: t, global: map[int]interface{}{}}
 	conns := make([]*net.UDPConn, n)
@@ -40,11 +42,7 @@ func newRaftCluster(t *testing.T, n int, o netOpts) *raftCluster {
 		addrs[i] = conns[i].LocalAddr().String()
 	}
 	for i := 0; i < n; i++ {
-		var pc PacketConn = conns[i]
-		if o.drop > 0 || o.dup > 0 || o.maxDelay > 0 {
-			pc = newFaultConn(conns[i], int64(500+i), o.drop, o.dup, o.maxDelay)
-		}
-		tr, err := New(Config{ID: i, Peers: addrs, Key: testKey, Conn: pc})
+		tr, err := New(Config{ID: i, Peers: addrs, Key: testKey, Conn: o.wrap(conns[i], int64(500+i))}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -135,7 +133,7 @@ func (c *raftCluster) leader() int {
 	return -1
 }
 
-func (c *raftCluster) count(idx int, cmd int) int {
+func (c *raftCluster) count(idx int, cmd interface{}) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	n := 0
@@ -148,7 +146,7 @@ func (c *raftCluster) count(idx int, cmd int) int {
 }
 
 // commit proposes cmd until at least want nodes have applied it.
-func (c *raftCluster) commit(cmd, want int, timeout time.Duration) (int, bool) {
+func (c *raftCluster) commit(cmd interface{}, want int, timeout time.Duration) (int, bool) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		for i, nd := range c.nodes {
@@ -222,8 +220,8 @@ func TestRaftOverUDPWithLossReorderAndDuplication(t *testing.T) {
 	var retrans, naks uint64
 	for _, nd := range c.nodes {
 		st := nd.tr.Stats()
-		retrans += st.Retransmits
-		naks += st.NaksSent
+		retrans += st.Stream.Retransmits
+		naks += st.Stream.NaksSent
 	}
 	t.Logf("60 commands committed; repair traffic: %d retransmissions, %d NAKs", retrans, naks)
 }
@@ -268,4 +266,37 @@ func TestRaftOverUDPLeaderFailover(t *testing.T) {
 			t.Errorf("command %d, committed before the failover, is missing on node %d", cmd, survivors[0])
 		}
 	}
+}
+
+// Raft over a reliable stream under heavier damage than the plain-datagram transport
+// could stand: the stream repairs every loss, so Raft never even sees them.
+func TestRaftOverUDPWithHeavyLoss(t *testing.T) {
+	c := newRaftCluster(t, 3, netOpts{drop: 0.20, dup: 0.10, maxDelay: 8 * time.Millisecond})
+	c.leader()
+	for cmd := 1; cmd <= 40; cmd++ {
+		if _, ok := c.commit(cmd, 2, 20*time.Second); !ok {
+			t.Fatalf("command %d was not committed on a majority under 20%% loss", cmd)
+		}
+	}
+	time.Sleep(time.Second)
+	c.checkSame(0, 1, 2)
+}
+
+// A single command of hundreds of KiB is replicated: there is no message size limit
+// any more (the previous datagram transport could not carry anything over 64 KiB).
+func TestRaftOverUDPReplicatesHugeCommands(t *testing.T) {
+	// 4ms of jitter and a little loss: enough that delivering the command takes longer than
+	// the default 80ms AppendTimeout (which the next test shows is a problem here).
+	c := newRaftCluster(t, 3, netOpts{drop: 0.03, dup: 0.03, maxDelay: 4 * time.Millisecond})
+	c.leader()
+	huge := strings.Repeat("0123456789abcdef", 20_000) // 320 KB
+	if _, ok := c.commit(huge, 3, 30*time.Second); !ok {
+		t.Fatal("a 320 KB command was not committed on all nodes")
+	}
+	for cmd := 1; cmd <= 5; cmd++ { // and the log keeps working behind it
+		if _, ok := c.commit(cmd, 3, 10*time.Second); !ok {
+			t.Fatalf("command %d after the huge one was not committed", cmd)
+		}
+	}
+	c.checkSame(0, 1, 2)
 }

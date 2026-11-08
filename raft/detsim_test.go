@@ -54,6 +54,11 @@ func (h *eventHeap) Pop() any {
 
 // ---- simulator ----
 
+type sentKey struct {
+	node, epoch int
+	seq         uint64
+}
+
 type detSim struct {
 	seed int64
 	rng  *rand.Rand
@@ -92,9 +97,8 @@ type detSim struct {
 	appliedAny  map[int]interface{}
 	expectApply []int
 	nextCmd     int
-	rejected    int               // proposals refused by the uncommitted-entries limit
-	slotAt      [][]time.Duration // [leader][peer]: when the current in-flight AppendEntries was sent
-	slotSeq     [][]uint64
+	rejected    int                       // proposals refused by the uncommitted-entries limit
+	sentAt      map[sentKey]time.Duration // when each AppendEntries was sent
 }
 
 func newDetSim(seed int64, dump bool) *detSim {
@@ -109,10 +113,9 @@ func newDetSim(seed int64, dump bool) *detSim {
 		leaderOf: map[int]int{}, seenCommit: make([]int, n), maxTerm: make([]int, n),
 		applied: make([]map[int]interface{}, n), appliedAny: map[int]interface{}{},
 		expectApply: make([]int, n), nextCmd: 1000,
-		slotAt: make([][]time.Duration, n), slotSeq: make([][]uint64, n),
+		sentAt: map[sentKey]time.Duration{},
 	}
 	for i := 0; i < n; i++ {
-		s.slotAt[i], s.slotSeq[i] = make([]time.Duration, n), make([]uint64, n)
 		s.stores[i] = &MemStorage{}
 		s.applied[i] = map[int]interface{}{}
 		s.boot(i)
@@ -257,11 +260,11 @@ func (s *detSim) flush(i int) bool {
 	}
 	for _, a := range rd.Appends {
 		a := a
-		s.slotAt[i][a.peer], s.slotSeq[i][a.peer] = s.now, a.seq
+		s.sentAt[sentKey{i, s.epoch[i], a.seq}] = s.now
 		s.rpc(i, a.peer, "append", func(dst *core) func(*core) {
 			reply := &AppendEntriesReply{}
 			dst.handleAppendEntries(a.args, reply)
-			return func(src *core) { src.onAppendReply(a.peer, a.ni, a.seq, a.args, reply) }
+			return func(src *core) { src.onAppendReply(a.peer, a.seq, a.args, reply) }
 		}, func(src *core) { src.onAppendLost(a.peer, a.seq) }, true)
 	}
 	s.onApply(i, rd.Apply)
@@ -432,11 +435,24 @@ func (s *detSim) checkLight() {
 			s.fail("node %d commitIndex went back %d -> %d", i, s.seenCommit[i], r.commitIndex)
 		}
 		if r.state == Leader {
-			// An in-flight slot must be freed by a reply or the timeout event; one
-			// that outlives RPCTimeout would starve that follower of heartbeats.
+			// Pipelining invariants. Every outstanding request is freed by its reply or
+			// by the timeout event, so none may outlive RPCTimeout (else that follower
+			// would be starved of heartbeats); the window is never exceeded and a
+			// probing follower has at most one request out; nextIndex stays sane.
 			for p := 0; p < s.n; p++ {
-				if r.inflight[p] && r.inflightSeq[p] == s.slotSeq[i][p] && s.now-s.slotAt[i][p] > RPCTimeout {
-					s.fail("STUCK SLOT: leader %d has had an AppendEntries to %d in flight for %v (> RPCTimeout)", i, p, s.now-s.slotAt[i][p])
+				if p == i {
+					continue
+				}
+				if len(r.pending[p]) > max(MaxInflightAppends, 1) || (r.probing[p] && len(r.pending[p]) > 1) {
+					s.fail("WINDOW: leader %d has %d requests to %d in flight (probing=%v, window %d)", i, len(r.pending[p]), p, r.probing[p], MaxInflightAppends)
+				}
+				if r.nextIndex[p] <= r.matchIndex[p] || r.nextIndex[p] > len(r.log) {
+					s.fail("PROGRESS: leader %d peer %d nextIndex=%d matchIndex=%d logLen=%d", i, p, r.nextIndex[p], r.matchIndex[p], len(r.log))
+				}
+				for _, seq := range r.pending[p] {
+					if at, ok := s.sentAt[sentKey{i, s.epoch[i], seq}]; ok && s.now-at > RPCTimeout {
+						s.fail("STUCK SLOT: leader %d has had request %d to %d in flight for %v (> RPCTimeout)", i, seq, p, s.now-at)
+					}
 				}
 			}
 			// Backpressure: entries this leader appended in its own term and has not
@@ -533,8 +549,12 @@ type simResult struct {
 
 func runSim(seed int64, dump bool) simResult {
 	// A small limit so the backpressure path is exercised (e.g. by a leader cut off in a minority).
-	defer func(old int) { MaxUncommittedEntries = old }(MaxUncommittedEntries)
+	defer func(u, w, b int) { MaxUncommittedEntries, MaxInflightAppends, MaxAppendEntries = u, w, b }(MaxUncommittedEntries, MaxInflightAppends, MaxAppendEntries)
 	MaxUncommittedEntries = 20
+	// Vary the pipeline per seed so window 1 (no pipelining), small windows and
+	// small/large batches are all exercised.
+	MaxInflightAppends = 1 + int(seed%6)
+	MaxAppendEntries = []int{2, 8, 128}[(seed/6)%3]
 	s := newDetSim(seed, dump)
 	s.drop, s.dup, s.maxDelay, s.longRate, s.longDelay = 0.15, 0.05, 20*time.Millisecond, 0.05, 500*time.Millisecond
 	s.crashRate = 0.006

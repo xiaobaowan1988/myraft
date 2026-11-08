@@ -22,6 +22,14 @@ var (
 	// MaxUncommittedEntries bounds the leader's log entries awaiting commit; past
 	// it, Propose fails with ErrProposalDropped. <= 0 disables the limit.
 	MaxUncommittedEntries = 1024
+
+	// MaxInflightAppends is how many AppendEntries may be outstanding per follower
+	// once its log match is confirmed (1 while probing). It multiplies the bound on
+	// goroutines blocked in RPCs: (n-1) * MaxInflightAppends.
+	MaxInflightAppends = 8
+
+	// MaxAppendEntries caps the entries in one AppendEntries (<= 0: no cap).
+	MaxAppendEntries = 128
 )
 
 // Raft is the I/O shell around the pure state machine (core). One goroutine,
@@ -212,7 +220,7 @@ func (r *Raft) flush() {
 		r.sendVote(v.peer, v.args)
 	}
 	for _, a := range rd.Appends {
-		r.sendAppend(a.peer, a.ni, a.seq, a.args)
+		r.sendAppend(a.peer, a.seq, a.args)
 	}
 	if len(rd.Apply) > 0 {
 		select {
@@ -240,7 +248,7 @@ func (r *Raft) sendVote(peer int, args *RequestVoteArgs) {
 	}()
 }
 
-func (r *Raft) sendAppend(peer, ni int, seq uint64, args *AppendEntriesArgs) {
+func (r *Raft) sendAppend(peer int, seq uint64, args *AppendEntriesArgs) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
 		defer cancel()
@@ -250,7 +258,7 @@ func (r *Raft) sendAppend(peer, ni int, seq uint64, args *AppendEntriesArgs) {
 			r.post(func() { r.c.onAppendLost(peer, seq) })
 			return
 		}
-		r.post(func() { r.c.onAppendReply(peer, ni, seq, args, reply) })
+		r.post(func() { r.c.onAppendReply(peer, seq, args, reply) })
 	}()
 }
 

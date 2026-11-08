@@ -39,12 +39,16 @@ type core struct {
 	nextIndex  []int
 	matchIndex []int
 
-	// At most one AppendEntries per follower is outstanding. inflight[p] is
-	// cleared by that request's reply or by its loss/timeout event; seq ties a
-	// release to the request it belongs to so stale events cannot free a newer one.
-	inflight    []bool
-	inflightSeq []uint64
-	seq         uint64
+	// Per-follower replication progress (like etcd/raft's Progress).
+	//   probing[p]: nextIndex is unconfirmed, so only one request may be outstanding.
+	//   otherwise (replicating): nextIndex is advanced optimistically when sending and up
+	//   to MaxInflightAppends requests may be outstanding.
+	// pending[p] holds the seqs of outstanding requests, oldest first. A reply or
+	// loss event only counts as "current" if its seq is still in pending[p]; any
+	// reset to probing empties it, which makes older replies stale.
+	probing []bool
+	pending [][]uint64
+	seq     uint64
 
 	granted          []bool // granted[p]: peer p voted for us in the current election (dedups duplicate replies)
 	electionDeadline time.Time
@@ -59,9 +63,9 @@ type voteOut struct {
 }
 
 type appendOut struct {
-	peer, ni int
-	seq      uint64
-	args     *AppendEntriesArgs
+	peer int
+	seq  uint64
+	args *AppendEntriesArgs
 }
 
 // Ready is what the state machine asks its driver to do.
@@ -135,14 +139,17 @@ func (c *core) becomeLeader() {
 	c.state = Leader
 	c.nextIndex = make([]int, c.n)
 	c.matchIndex = make([]int, c.n)
-	c.inflight = make([]bool, c.n)
-	c.inflightSeq = make([]uint64, c.n)
+	c.probing = make([]bool, c.n)
+	c.pending = make([][]uint64, c.n)
+	for i := range c.probing {
+		c.probing[i] = true
+	}
 	for i := range c.nextIndex {
 		c.nextIndex[i] = len(c.log)
 	}
 	// No-op so entries from earlier terms can be committed indirectly.
 	c.appendLocal(LogEntry{Term: c.currentTerm})
-	c.broadcast()
+	c.broadcast(true)
 }
 
 func (c *core) advanceCommit() {
@@ -190,7 +197,7 @@ func (c *core) propose(cmd interface{}) (index, term int, err error) {
 		return -1, -1, ErrProposalDropped
 	}
 	c.appendLocal(LogEntry{Term: c.currentTerm, Command: cmd})
-	c.broadcast()
+	c.broadcast(false)
 	return len(c.log) - 1, c.currentTerm, nil
 }
 
@@ -199,7 +206,7 @@ func (c *core) propose(cmd interface{}) (index, term int, err error) {
 func (c *core) onTick() {
 	if c.state == Leader {
 		if c.now().Sub(c.lastBroadcast) >= HeartbeatInterval {
-			c.broadcast()
+			c.broadcast(true)
 		}
 	} else if c.now().After(c.electionDeadline) {
 		c.startElection()
@@ -274,51 +281,120 @@ func (c *core) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 
 // ---- replication ----
 
-func (c *core) broadcast() {
-	c.lastBroadcast = c.now()
+// broadcast sends to every follower. With heartbeat set it also restarts the
+// heartbeat timer and guarantees each follower with window room gets a message.
+func (c *core) broadcast(heartbeat bool) {
+	if heartbeat {
+		c.lastBroadcast = c.now()
+	}
 	for peer := 0; peer < c.n; peer++ {
 		if peer != c.me {
-			c.replicate(peer)
+			c.replicate(peer, heartbeat)
 		}
 	}
 }
 
-// replicate queues one AppendEntries request for peer, unless one is already
-// outstanding (this bounds in-flight work per follower; heartbeats included).
-func (c *core) replicate(peer int) {
-	if c.state != Leader || c.inflight[peer] {
+// canSend reports whether peer's window has room: one request while probing,
+// up to MaxInflightAppends while replicating.
+func (c *core) canSend(peer int) bool {
+	if c.probing[peer] {
+		return len(c.pending[peer]) == 0
+	}
+	return len(c.pending[peer]) < max(MaxInflightAppends, 1)
+}
+
+// replicate sends peer as many batches of new entries as the window allows. If
+// heartbeat is set and nothing was sent, it sends one empty heartbeat instead.
+func (c *core) replicate(peer int, heartbeat bool) {
+	if c.state != Leader {
 		return
 	}
+	sent := false
+	for c.canSend(peer) && c.nextIndex[peer] < len(c.log) {
+		c.sendBatch(peer)
+		sent = true
+	}
+	if heartbeat && !sent && c.canSend(peer) {
+		c.sendHeartbeat(peer)
+	}
+}
+
+func (c *core) newRequest(peer int, prev int, entries []LogEntry) {
+	args := &AppendEntriesArgs{
+		Term: c.currentTerm, LeaderID: c.me,
+		PrevLogIndex: prev, PrevLogTerm: c.log[prev].Term,
+		Entries:      entries,
+		LeaderCommit: c.commitIndex,
+	}
 	c.seq++
-	c.inflight[peer], c.inflightSeq[peer] = true, c.seq
+	c.pending[peer] = append(c.pending[peer], c.seq)
+	c.rd.Appends = append(c.rd.Appends, appendOut{peer, c.seq, args})
+}
+
+// sendBatch sends the next batch starting at nextIndex. While replicating it
+// optimistically advances nextIndex past the batch so the next one can follow
+// without waiting for this reply.
+func (c *core) sendBatch(peer int) {
 	ni := c.nextIndex[peer]
 	if ni < 1 {
 		ni = 1
 	}
-	if ni > len(c.log) {
-		ni = len(c.log)
+	end := len(c.log)
+	if MaxAppendEntries > 0 && ni+MaxAppendEntries < end {
+		end = ni + MaxAppendEntries
 	}
-	prev := ni - 1
-	args := &AppendEntriesArgs{
-		Term: c.currentTerm, LeaderID: c.me,
-		PrevLogIndex: prev, PrevLogTerm: c.log[prev].Term,
-		Entries:      append([]LogEntry(nil), c.log[ni:]...),
-		LeaderCommit: c.commitIndex,
-	}
-	c.rd.Appends = append(c.rd.Appends, appendOut{peer, ni, c.seq, args})
-}
-
-// release frees peer's in-flight slot if seq is still the current request.
-func (c *core) release(peer int, seq uint64) {
-	if c.state == Leader && c.inflight[peer] && c.inflightSeq[peer] == seq {
-		c.inflight[peer] = false
+	c.newRequest(peer, ni-1, append([]LogEntry(nil), c.log[ni:end]...))
+	if !c.probing[peer] {
+		c.nextIndex[peer] = end
 	}
 }
 
-// onAppendLost handles a timed-out or lost AppendEntries; the next heartbeat retries.
-func (c *core) onAppendLost(peer int, seq uint64) { c.release(peer, seq) }
+// sendHeartbeat sends an empty AppendEntries anchored at matchIndex, a position
+// already known to match, so reordering or in-flight batches cannot make it fail.
+func (c *core) sendHeartbeat(peer int) {
+	c.newRequest(peer, c.matchIndex[peer], nil)
+}
 
-func (c *core) onAppendReply(peer, ni int, seq uint64, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+// release removes seq from peer's outstanding set and reports whether it was
+// there, i.e. whether the reply/loss is current rather than stale.
+func (c *core) release(peer int, seq uint64) bool {
+	if c.state != Leader {
+		return false
+	}
+	p := c.pending[peer]
+	for i, s := range p {
+		if s == seq {
+			c.pending[peer] = append(p[:i:i], p[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// resetToProbe drops all outstanding requests of peer (their replies become
+// stale) and returns it to one-at-a-time probing from nextIndex.
+func (c *core) resetToProbe(peer, next int) {
+	c.probing[peer] = true
+	c.pending[peer] = nil
+	if next < c.matchIndex[peer]+1 {
+		next = c.matchIndex[peer] + 1
+	}
+	if next < 1 {
+		next = 1
+	}
+	c.nextIndex[peer] = next
+}
+
+// onAppendLost handles a timed-out or lost AppendEntries. If it was current,
+// the pipeline can no longer be trusted: restart probing from the known match.
+// The next heartbeat retries.
+func (c *core) onAppendLost(peer int, seq uint64) {
+	if c.release(peer, seq) {
+		c.resetToProbe(peer, c.matchIndex[peer]+1)
+	}
+}
+
+func (c *core) onAppendReply(peer int, seq uint64, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if reply.Term > c.currentTerm {
 		c.becomeFollower(reply.Term)
 		c.resetElection()
@@ -327,25 +403,29 @@ func (c *core) onAppendReply(peer, ni int, seq uint64, args *AppendEntriesArgs, 
 	if c.state != Leader || c.currentTerm != args.Term {
 		return // stale reply
 	}
-	c.release(peer, seq)
+	current := c.release(peer, seq)
 	prev := args.PrevLogIndex
 	if reply.Success {
+		// Valid even for a stale reply: within this term the follower really
+		// holds the leader's log up to match.
 		match := prev + len(args.Entries)
 		if match > c.matchIndex[peer] {
 			c.matchIndex[peer] = match
 		}
-		if c.matchIndex[peer]+1 > c.nextIndex[peer] {
+		if c.nextIndex[peer] < c.matchIndex[peer]+1 {
 			c.nextIndex[peer] = c.matchIndex[peer] + 1
 		}
-		c.advanceCommit()
-		if c.nextIndex[peer] < len(c.log) {
-			c.replicate(peer) // more entries pending: keep the pipe busy
+		if current && c.probing[peer] && match+1 >= c.nextIndex[peer] {
+			c.probing[peer] = false // log match confirmed: start pipelining
 		}
+		c.advanceCommit()
+		c.replicate(peer, false) // refill the window
 		return
 	}
-	if c.nextIndex[peer] != ni {
-		return // another reply already moved nextIndex
+	if !current {
+		return // a rejection from before the last reset says nothing new
 	}
+	ni := prev + 1
 	next := reply.ConflictIndex
 	if reply.ConflictTerm != -1 {
 		for i := len(c.log) - 1; i >= 1; i-- {
@@ -361,15 +441,9 @@ func (c *core) onAppendReply(peer, ni int, seq uint64, args *AppendEntriesArgs, 
 	if next >= ni {
 		next = ni - 1
 	}
-	if next < c.matchIndex[peer]+1 {
-		next = c.matchIndex[peer] + 1
-	}
-	if next < 1 {
-		next = 1
-	}
-	c.nextIndex[peer] = next
-	if next < ni {
-		c.replicate(peer) // retry immediately with the backed-off index
+	c.resetToProbe(peer, next)
+	if c.nextIndex[peer] < ni {
+		c.replicate(peer, false) // retry immediately with the backed-off index
 	}
 }
 

@@ -498,8 +498,26 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
       - **存活的等价变异**：帧长度"从最后一帧到第一帧"发布，改成顺序发布，测试不变。分析：读者看到的只是更早出现的中间片段，由 Assembler 容纳，正确性不受影响；所以"整条消息一次性出现"只是一个不保证的优化，不为它加测试。
       - 测试：往返与位置、帧头字段、分片边界（`maxPayload±1`、多片、大消息）、背压、跨 490 个 term 的轮转、term 末尾 padding、"发布前不可见"（含分片消息，钩子 `testBeforePublish`）、`Scan`、4 个发布者并发（2.4 万条跨数百个 term）、3 个**独立进程**发布者（1.5 万条）、各种空洞、过期 claim、Assembler。
       - 测试环境的坑：变异失败时，子进程发布者会在父进程失败后继续跑最多 60 秒，占 CPU，让紧接着的变异测试看起来是"卡死/超时"。之后的变异运行用 `-timeout 40s` 并在每次后 `pkill`。
-    - [ ] **21.3 Driver 骨架 + IPC 通道**：`MediaDriver` 启动/关闭、CnC 文件、Conductor、客户端库、IPC publication/subscription（同机不走 UDP）、`pub-lmt` 背压、客户端 keepalive 与超时回收、Driver 心跳。
+    - [x] **21.3 Driver 骨架 + IPC 通道**：`MediaDriver` 启动/关闭、CnC 文件、Conductor、客户端库、IPC publication/subscription（同机不走 UDP）、`pub-lmt` 背压、客户端 keepalive 与超时回收、Driver 心跳。
       测试：同进程与跨进程的 IPC 收发（有序、恰好一次）；订阅者慢 → `BackPressured`，追上后恢复；客户端被杀 → Driver 回收其资源；Driver 被杀 → 客户端报错；多个 subscriber 的 `pub-lmt` 取最慢者。
+      **21.3 结果**（`go vet`、`go test -race ./driver/...` 通过）：
+      - **新增的包**：`driver/cnc`（CnC 文件布局：头 + 命令环 + 事件广播 + 计数器；命令/事件的编解码，对截断和随机输入不 panic）、`driver`（`Config`、`MediaDriver.Open/Start/Launch/Close`、`Conductor`、`IdleStrategy`、agent 运行器）、`driver/client`（`Connect`、`AddPublication/AddSubscription`、`Offer/Poll`）。
+      - **与计划的偏离**：
+        1. 同一 stream 的多个 `AddPublication` **共享同一个 log**（引用计数），而不是每次一个——多个客户端/进程要写同一个 log，这是 log buffer 多写者设计的用途。最后一个引用移除后进入 draining：订阅者读完（或超过 `Linger`）才销毁，销毁时发 `UnavailableImage`、释放计数器、删文件。
+        2. `logbuf` 增加 `connected` 标志与 `SimulateDeadPublisher`（故障注入，用于测试 `Unblock`），`Params.Validate` 导出。
+        3. 客户端的 `Publication`/`Subscription` 内部用 `sync.RWMutex` 保护映射的生命周期（`Offer`/`Poll` 持读锁，驱动撤销映射时持写锁），**不是** Aeron 那样的无锁延迟释放：释放一个仍在被使用的 mmap 会让进程段错误，宁可在热路径上多一次读锁。
+        4. 只支持 `ipc` 通道；UDP 在 21.4。
+      - **已验证的行为**：发布/订阅往返（含分片，3000 条）；订阅者先于发布者；后加入的订阅者只看到加入之后的消息；多 stream 互不串扰；超长消息 `TooBig`；**背压跟随最慢的订阅者**（快的读完后发布者仍被慢的拦住，慢的读了才放行）；同 stream 的多个客户端并发发布（4 个来源，每源有序）；驱动拒绝不支持的 channel、未知或别人的 registration；垃圾命令被计数且驱动继续工作；撤销的 publication 先被读完再消失、文件被删、新 publication 换新 log；`Linger` 超时后即使没读完也销毁；客户端 `Close` 释放全部资源与计数器；**静默客户端被驱动回收**（假时钟）；客户端发现驱动死亡（假时钟，驱动 `Close` 后心跳停止）并让 `Offer/Poll/新请求` 报错；活着的驱动不会被误判为死亡；一个目录只允许一个活驱动，死驱动的文件被清理；驱动对死发布者留下的空洞做 `Unblock`（有标记/无标记两种）；订阅者全部离开后 `NotConnected`。
+        **跨进程**：3 个子进程发布者 + 父进程订阅者（6000 条，逐来源有序）；子进程订阅者；**`SIGKILL` 一个持有 publication 和 subscription 的客户端进程，驱动在超时后回收其全部资源与计数器**。
+        时间相关的测试全部用假时钟（`Config.Clock`/`Options.Clock`），因此不依赖真实等待；`Conductor` 也可以不启动协程、由测试逐个周期手动 `DoWork`。
+      - **变异验证**：17 个变异（限制不更新、限制跟随最快者、从 0 加入、不等读完就销毁、无 linger 超时、静默客户端不回收、心跳不刷新、从不 unblock、同 stream 不共享 log、不发 `UnavailableImage`、不释放计数器、客户端不发 keepalive、客户端不发现死驱动、消费位置不上报、`Offer` 忽略 connected、`Offer` 忽略限制、连接标志不清除）→ 最初 **1 个存活**：连接标志不清除，补了测试后抓到。其中"消费位置不上报""`Offer` 忽略限制"是靠测试超时（100s）被抓到的，不是靠断言，属于**弱检测**。
+        另一个教训：变异脚本里的 `pkill -f client.test` 的正则把自己的 shell 命令行也匹配了（`client_test.go.bak`），杀掉了命令；改成 `pkill -f "[c]lient\.test"`。
+      - **已知限制**：
+        1. 客户端事件走广播缓冲，落后一整圈会丢事件（`Lapped`），此时请求只能等超时，没有重发。
+        2. 没有错误日志区（计划里的 CnC 布局提过，未实现）；错误通过事件返回给发起请求的客户端，驱动内部的异常只计数。
+        3. 一个客户端异常退出且不关闭，其 pub/sub 要等 `ClientLivenessTimeout`（默认 5s）才被回收，期间同 stream 的 publication 仍指向它。
+        4. 位置上限只在写入前检查，每个并发发布者最多可多写一条消息；`PublicationWindow` 与最大消息长度、并发发布者数之间的约束只写在文档里，没有强制。
+        5. 驱动的 `Linger` 与 `UnblockTimeout` 默认值（5s/10s）是照 Aeron 的量级选的，没有调优。
     - [ ] **21.4 UDP 通道（无故障网络）**：`proto` 编解码、Sender、Receiver、Setup/StatusMessage 握手、image 创建、数据传输、流控窗口、分片重组。
       测试：编解码往返与畸形包（截断、错误长度、未知类型）不 panic；握手；收发有序、恰好一次；接收窗口被填满后发送端停止、订阅者消费后恢复；大消息跨多个 MTU；两个 stream、多个 session 互不串扰。
     - [ ] **21.5 故障下的可靠性**：NAK、重传、重传抑制、心跳发现尾部丢失、重复包、乱序、迟到的订阅者（从当前位置加入而不是从头）、发送端或接收端 Driver 重启（session 变化）。

@@ -77,6 +77,7 @@ const (
 	metaTermLength = 264
 	metaSession    = 268
 	metaStream     = 272
+	metaConnected  = 276 // int32: 1 once at least one reader is attached
 	metaMagic      = 280
 	magic          = 0x4C4F4742
 	version        = 1
@@ -117,7 +118,8 @@ type Params struct {
 	StreamID      int32
 }
 
-func (p Params) validate() error {
+// Validate checks the parameters (the buffer size is checked separately).
+func (p Params) Validate() error {
 	if p.TermLength < MinTermLength || p.TermLength > MaxTermLength || p.TermLength&(p.TermLength-1) != 0 {
 		return fmt.Errorf("logbuf: term length %d is not a power of two in [%d, %d]", p.TermLength, MinTermLength, MaxTermLength)
 	}
@@ -146,7 +148,7 @@ type LogBuffer struct {
 
 // Create initialises a freshly zeroed buffer of FileLength(p.TermLength) bytes.
 func Create(buf shm.Buffer, p Params) (*LogBuffer, error) {
-	if err := p.validate(); err != nil {
+	if err := p.Validate(); err != nil {
 		return nil, err
 	}
 	if buf.Len() != FileLength(p.TermLength) {
@@ -198,6 +200,18 @@ func open(buf shm.Buffer, termLength int) *LogBuffer {
 	}
 	return l
 }
+
+// SetConnected records whether any reader is attached (written by the driver).
+func (l *LogBuffer) SetConnected(c bool) {
+	v := int32(0)
+	if c {
+		v = 1
+	}
+	l.meta.PutInt32Ordered(metaConnected, v)
+}
+
+// IsConnected reports whether a reader is attached; publishers return NotConnected otherwise.
+func (l *LogBuffer) IsConnected() bool { return l.meta.Int32Volatile(metaConnected) == 1 }
 
 func (l *LogBuffer) TermLength() int      { return l.termLength }
 func (l *LogBuffer) MTU() int             { return l.mtu }
@@ -516,4 +530,29 @@ func (l *LogBuffer) writePaddingOver(part int, termID int32, off, length int) {
 	t := l.terms[part]
 	l.putHeaderFields(t, off, 0, TypePad, termID)
 	t.PutInt32Ordered(off+offLength, int32(length))
+}
+
+// SimulateDeadPublisher claims space for a message of size bytes the way Offer does
+// and then stops, as a publisher killed in the middle of Offer would: with
+// writeMarker the claim carries its "being written" marker, without it the space is
+// untouched. It exists for fault-injection tests of Unblock, in this package and in
+// the driver's.
+func (l *LogBuffer) SimulateDeadPublisher(size int, writeMarker bool) Status {
+	for {
+		termCount := l.meta.Int32Volatile(metaActive)
+		part := l.partitionOf(termCount)
+		termID := int32(l.meta.Int64Volatile(l.tailOff(part)) >> 32)
+		if termID-l.initialTermID != termCount {
+			continue
+		}
+		required := l.framedLength(size)
+		off, st := l.claim(termCount, part, termID, required)
+		if st == AdminAction {
+			continue
+		}
+		if st == Ok && writeMarker {
+			l.terms[part].PutInt32Ordered(off+offLength, -int32(required))
+		}
+		return st
+	}
 }

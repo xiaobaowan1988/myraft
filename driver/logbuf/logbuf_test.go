@@ -718,3 +718,20 @@ func TestAssembler(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+func TestConnectedFlagIsSharedThroughTheMetadata(t *testing.T) {
+	buf := shm.Wrap(shm.Heap(FileLength(4096)))
+	a, _ := Create(buf, Params{TermLength: 4096, MTU: 256})
+	b, _ := Wrap(buf)
+	if a.IsConnected() || b.IsConnected() {
+		t.Fatal("a new log is connected")
+	}
+	a.SetConnected(true)
+	if !b.IsConnected() {
+		t.Fatal("the flag set through one handle is not seen through the other")
+	}
+	a.SetConnected(false)
+	if b.IsConnected() {
+		t.Fatal("the flag was not cleared")
+	}
+}

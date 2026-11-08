@@ -24,9 +24,10 @@ var (
 	MaxUncommittedEntries = 1024
 
 	// MaxInflightAppends is how many AppendEntries may be outstanding per follower
-	// once its log match is confirmed (1 while probing). It multiplies the bound on
-	// goroutines blocked in RPCs: (n-1) * MaxInflightAppends.
-	MaxInflightAppends = 8
+	// once its log match is confirmed (1 while probing). It is also the number of
+	// fixed worker goroutines per follower, started once in Make, so it sets the
+	// resident goroutine count: 2 + (n-1)*(MaxInflightAppends+1).
+	MaxInflightAppends = 4
 
 	// MaxAppendEntries caps the entries in one AppendEntries (<= 0: no cap).
 	MaxAppendEntries = 128
@@ -60,6 +61,29 @@ type Raft struct {
 	// after holds actions to run once the current event's Ready has been
 	// persisted (releasing RPC callers). Loop only.
 	after []func()
+
+	// Fixed worker pools, one per follower, started in Make: the number of
+	// goroutines blocked in RPCs never depends on load.
+	peers []*peerQueues
+}
+
+// peerQueues feeds one follower's workers. Each in-flight AppendEntries has a
+// worker of its own (window == workers), so requests never wait in the queue
+// and their RPCTimeout is not eaten by queueing.
+type peerQueues struct {
+	appends chan appendJob
+	votes   chan voteJob
+}
+
+type appendJob struct {
+	seq      uint64
+	args     *AppendEntriesArgs
+	deadline time.Time
+}
+
+type voteJob struct {
+	args     *RequestVoteArgs
+	deadline time.Time
 }
 
 // restoreCore loads persistent state from st and builds the state machine.
@@ -88,6 +112,18 @@ func Make(me, n int, tr Transport, st Storage, applyCh chan ApplyMsg) (*Raft, er
 		applyFeed: make(chan []ApplyMsg, 16),
 		done:      make(chan struct{}),
 		stopped:   make(chan struct{}),
+		peers:     make([]*peerQueues, n),
+	}
+	for p := 0; p < n; p++ {
+		if p == me {
+			continue
+		}
+		q := &peerQueues{appends: make(chan appendJob, c.window), votes: make(chan voteJob, 2)}
+		r.peers[p] = q
+		for i := 0; i < c.window; i++ {
+			go r.appendWorker(p, q)
+		}
+		go r.voteWorker(p, q)
 	}
 	go r.run()
 	go r.applyPump()
@@ -234,32 +270,68 @@ func (r *Raft) flush() {
 	r.after = r.after[:0]
 }
 
-// sendVote and sendAppend send from helper goroutines (the loop never blocks
-// on the network) and post the reply back as an event.
+// sendVote and sendAppend only enqueue; the peer's fixed workers do the RPC.
+// They run on the event loop and never block.
 func (r *Raft) sendVote(peer int, args *RequestVoteArgs) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
-		defer cancel()
-		reply, ok := r.tr.RequestVote(ctx, peer, args)
-		if !ok {
-			return
-		}
-		r.post(func() { r.c.onVoteReply(peer, args.Term, reply) })
-	}()
+	select {
+	case r.peers[peer].votes <- voteJob{args, time.Now().Add(RPCTimeout)}:
+	default:
+		// Queue full (the vote worker is stuck): drop it. Raft tolerates lost
+		// vote requests; the next election retries.
+	}
 }
 
 func (r *Raft) sendAppend(peer int, seq uint64, args *AppendEntriesArgs) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
-		defer cancel()
-		reply, ok := r.tr.AppendEntries(ctx, peer, args)
-		if !ok {
-			// Free the in-flight slot so the next heartbeat can retry.
-			r.post(func() { r.c.onAppendLost(peer, seq) })
+	select {
+	case r.peers[peer].appends <- appendJob{seq, args, time.Now().Add(RPCTimeout)}:
+	default:
+		// Cannot happen while in-flight <= window == queue capacity; if it ever
+		// does, treat the request as lost so its slot is freed.
+		r.c.onAppendLost(peer, seq)
+	}
+}
+
+func (r *Raft) appendWorker(peer int, q *peerQueues) {
+	for {
+		select {
+		case <-r.done:
 			return
+		case j := <-q.appends:
+			ctx, cancel := context.WithDeadline(context.Background(), j.deadline)
+			var reply *AppendEntriesReply
+			ok := false
+			if ctx.Err() == nil {
+				reply, ok = r.tr.AppendEntries(ctx, peer, j.args)
+			}
+			cancel()
+			if !ok {
+				// Free the in-flight slot so the next heartbeat can retry.
+				r.post(func() { r.c.onAppendLost(peer, j.seq) })
+				continue
+			}
+			r.post(func() { r.c.onAppendReply(peer, j.seq, j.args, reply) })
 		}
-		r.post(func() { r.c.onAppendReply(peer, seq, args, reply) })
-	}()
+	}
+}
+
+func (r *Raft) voteWorker(peer int, q *peerQueues) {
+	for {
+		select {
+		case <-r.done:
+			return
+		case j := <-q.votes:
+			ctx, cancel := context.WithDeadline(context.Background(), j.deadline)
+			var reply *RequestVoteReply
+			ok := false
+			if ctx.Err() == nil {
+				reply, ok = r.tr.RequestVote(ctx, peer, j.args)
+			}
+			cancel()
+			if ok {
+				r.post(func() { r.c.onVoteReply(peer, j.args.Term, reply) })
+			}
+		}
+	}
 }
 
 // applyPump is an unbounded, lock-free queue between the event loop and the

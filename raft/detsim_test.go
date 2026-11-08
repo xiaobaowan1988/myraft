@@ -443,8 +443,8 @@ func (s *detSim) checkLight() {
 				if p == i {
 					continue
 				}
-				if len(r.pending[p]) > max(MaxInflightAppends, 1) || (r.probing[p] && len(r.pending[p]) > 1) {
-					s.fail("WINDOW: leader %d has %d requests to %d in flight (probing=%v, window %d)", i, len(r.pending[p]), p, r.probing[p], MaxInflightAppends)
+				if len(r.pending[p]) > r.window || (r.probing[p] && len(r.pending[p]) > 1) {
+					s.fail("WINDOW: leader %d has %d requests to %d in flight (probing=%v, window %d)", i, len(r.pending[p]), p, r.probing[p], r.window)
 				}
 				if r.nextIndex[p] <= r.matchIndex[p] || r.nextIndex[p] > len(r.log) {
 					s.fail("PROGRESS: leader %d peer %d nextIndex=%d matchIndex=%d logLen=%d", i, p, r.nextIndex[p], r.matchIndex[p], len(r.log))

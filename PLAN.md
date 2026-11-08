@@ -120,15 +120,34 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
     `matchIndex`（同一任期内它依然成立），但不改变状态。成功应答后继续填满窗口。
   - 纯心跳（没有新日志时）不带日志、`prevLogIndex = matchIndex`（已确认匹配，不受乱序影响），
     follower 的 commit 因此不会越过已确认的前缀；数据请求同样携带 `LeaderCommit`。
-  - **协程上界变化**：AppendEntries 协程上界由 `n-1` 变为 `(n-1) × MaxInflightAppends`（n=5、默认 8 时为 32）。
-    这是与吞吐的取舍；etcd 用每 peer 固定 worker 协程避免了该代价，这里暂不采用。探测状态下仍恒为每个 follower 1 个，
-    因此"对端永不应答"时的界不变。
+  - **协程上界变化**：AppendEntries 协程上界由 `n-1` 变为 `(n-1) × MaxInflightAppends`；该代价已在阶段 12 通过固定 worker 协程消除
+    （协程数不再随负载变化）。探测状态下仍恒为每个 follower 1 个在途请求。
   - 验证：模拟器按种子变化窗口（1–6）与批大小（2/8/128）；新增不变量：在途数 ≤ 窗口、探测状态 ≤ 1、
     每个在途请求存活 ≤ `RPCTimeout`、`matchIndex < nextIndex ≤ len(log)`；
     新测试 `TestPipelineThroughput`：在带延迟的传输上，窗口 8 的提交速度必须明显快于窗口 1。
   - 验证结果：正常代码 2000 个种子通过；`TestPipelineThroughput`（600 条、批大小 10、往返 30ms）窗口 1 用 1.9s、
     窗口 8 用 0.28s，约 6.9 倍。变异验证：发送时乐观推进 `matchIndex`（未确认就算已复制）300 个种子中 205 个失败
     （含"已提交条目丢失"）；窗口不设上限 240 个失败。
+
+- [x] **12. 固定 worker 协程（取代"每个请求一个协程"，对应 etcd rafthttp 的 pipeline：每 peer 固定 4 个 worker + 缓冲队列）**：
+  - 问题：此前每个 RPC 起一个临时协程，协程数随负载浮动；窗口调大后上界 `(n-1)×窗口` 也随之变大。
+  - `Make` 时为每个 follower 一次性启动：`窗口` 个 AppendEntries worker + 1 个投票 worker，之后协程数与负载无关。
+    发送只是把任务放进该 peer 的有缓冲 channel；worker 取任务、调用 `Transport`、再把结果作为事件投回事件循环。
+  - **窗口 = worker 数**（窗口在构造 `core` 时固定下来并传给外壳）：每个在途请求都有现成的 worker，不会在队列里排队耗掉
+    `RPCTimeout`。不采用 etcd 的"队列大于 worker 数"：排队的请求会超时、触发回到探测，慢网络下更差。
+  - 默认 `MaxInflightAppends` 由 8 降为 4（与 etcd 的 `connPerPipeline` 一致），常驻协程 = `2 + (n-1)×(窗口+1)`（n=5 为 22）。
+  - 队列满（理论上不会发生，因为在途数 ≤ 窗口 ≤ 队列容量）的兜底：AppendEntries 按"丢失"处理；投票请求直接丢弃（Raft 容忍丢失）。
+  - 投票 worker 独立于 AppendEntries worker，避免投票被卡住的复制请求拖慢。
+  - 仍然要求 Transport 遵守 ctx：无视 ctx 的调用会永久占住一个 worker（探测状态下一个 follower 只会占 1 个）。
+  - 测试：`TestInFlightBounded` 改为断言协程数 ≤ 常驻上界 + 少量计时器噪声，且**不随时间增长**；
+    `TestPipelineThroughput` 额外断言处理 600 条提案期间协程数几乎不变（证明没有逐请求协程）。
+  - 注意：模拟器不建模 worker 与队列（它按"发送时刻起算超时"，与外壳语义等价，因为窗口 = worker 数不排队）；
+    worker 的启动/停止、队列兜底只由外壳测试覆盖。
+  - 验证结果：3 节点、对端永不应答时协程数稳定在常驻上界附近（实测 15–16，上界 12 + 少量计时器协程），
+    前后两个 1 秒窗口持平；600 条提案、窗口 8 期间协程数几乎不变，吞吐仍约 6.8 倍。
+    变异验证：把 `sendAppend` 改回"每请求一个协程"，`TestPipelineThroughput` 失败（窗口 8 时协程多出 26 个）。
+    模拟器 2000 个种子、`go test -race` 全部通过。
+  - 代价：常驻协程增加（n=5、窗口 4 时每节点 22 个，空闲时也在），换取与负载无关的确定上界。
 
 ## 与原指南的有意偏差（原因）
 

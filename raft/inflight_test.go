@@ -62,7 +62,12 @@ func (s *stuckTransport) AppendEntries(ctx context.Context, to int, args *Append
 	return nil, false
 }
 
-func runStuck(t *testing.T, honorCtx bool) (*stuckTransport, int, int) {
+type stuckResult struct {
+	tr                      *stuckTransport
+	base, early, late, peak int
+}
+
+func runStuck(t *testing.T, honorCtx bool) stuckResult {
 	tr := &stuckTransport{honorCtx: honorCtx, release: make(chan struct{})}
 	time.Sleep(50 * time.Millisecond)
 	base := runtime.NumGoroutine()
@@ -74,37 +79,48 @@ func runStuck(t *testing.T, honorCtx bool) (*stuckTransport, int, int) {
 	stop := func() { once.Do(func() { close(tr.release); r.Kill() }) }
 	t.Cleanup(stop)
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, isL := r.State(); isL {
-			break
+	becomeLeader(t, r)
+	time.Sleep(300 * time.Millisecond) // let every worker start and the first timeouts pass
+	res := stuckResult{tr: tr, base: base}
+	sample := func(d time.Duration) int {
+		peak := 0
+		for end := time.Now().Add(d); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+			if n := runtime.NumGoroutine(); n > peak {
+				peak = n
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		return peak
 	}
-	if _, isL := r.State(); !isL {
-		t.Fatal("node 0 never became leader")
-	}
-	peak := 0
-	for end := time.Now().Add(2 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
-		if n := runtime.NumGoroutine(); n > peak {
-			peak = n
-		}
-	}
-	return tr, base, peak
+	res.early = sample(time.Second)
+	res.late = sample(time.Second)
+	res.peak = max(res.early, res.late)
+	return res
 }
 
-// With peers that never answer, goroutines must stay bounded and no peer may
-// ever have more than one AppendEntries outstanding.
+// With peers that never answer, the goroutine count must equal the fixed
+// resident set (it does not grow with the number of requests or elections), and
+// no peer may ever have more than one AppendEntries outstanding (probing).
 func TestInFlightBounded(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		honorCtx bool
 	}{{"transport honors ctx", true}, {"transport ignores ctx", false}} {
 		t.Run(tc.name, func(t *testing.T) {
-			tr, base, peak := runStuck(t, tc.honorCtx)
-			// run loop + applyPump + <=2 appends + <=2 votes (+ slack for test/timers).
-			if growth := peak - base; growth > 10 {
-				t.Errorf("goroutines grew by %d (base %d, peak %d): not bounded", growth, base, peak)
+			old := MaxInflightAppends
+			MaxInflightAppends = 4
+			defer func() { MaxInflightAppends = old }()
+			res := runStuck(t, tc.honorCtx)
+			tr := res.tr
+			const n, workers = 3, 4
+			// 2 (run loop, applyPump) + per follower (workers + 1 vote worker), plus a few
+			// short-lived goroutines the runtime starts when a context deadline fires.
+			resident := 2 + (n-1)*(workers+1)
+			if growth := res.peak - res.base; growth > resident+4 {
+				t.Errorf("goroutines grew by %d (base %d, peak %d); expected at most %d resident + 4 transient", growth, res.base, res.peak, resident)
+			}
+			// Fixed pool: nothing may accumulate over time (a per-request design would).
+			if res.late > res.early+2 {
+				t.Errorf("goroutine count grew while running: first second peak %d, second second peak %d", res.early, res.late)
 			}
 			for p := 1; p <= 2; p++ {
 				if m := tr.maxCur[p].Load(); m > 1 {
@@ -126,7 +142,7 @@ func TestInFlightBounded(t *testing.T) {
 					}
 				}
 			}
-			t.Logf("goroutines base=%d peak=%d, votes blocked at most %d", base, peak, tr.maxVote.Load())
+			t.Logf("goroutines base=%d early=%d late=%d (resident bound %d)", res.base, res.early, res.late, resident)
 		})
 	}
 }

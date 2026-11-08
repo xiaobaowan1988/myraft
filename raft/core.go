@@ -49,6 +49,7 @@ type core struct {
 	probing []bool
 	pending [][]uint64
 	seq     uint64
+	window  int // MaxInflightAppends, fixed at construction (the shell sizes its worker pools from it)
 
 	granted          []bool // granted[p]: peer p voted for us in the current election (dedups duplicate replies)
 	electionDeadline time.Time
@@ -92,8 +93,9 @@ func newCore(me, n, term, votedFor int, log []LogEntry, seed int64, now func() t
 	c := &core{
 		me: me, n: n, now: now,
 		currentTerm: term, votedFor: votedFor, log: log,
-		state: Follower,
-		rng:   rand.New(rand.NewSource(seed)),
+		state:  Follower,
+		rng:    rand.New(rand.NewSource(seed)),
+		window: max(MaxInflightAppends, 1),
 	}
 	c.resetElection()
 	return c
@@ -300,7 +302,7 @@ func (c *core) canSend(peer int) bool {
 	if c.probing[peer] {
 		return len(c.pending[peer]) == 0
 	}
-	return len(c.pending[peer]) < max(MaxInflightAppends, 1)
+	return len(c.pending[peer]) < c.window
 }
 
 // replicate sends peer as many batches of new entries as the window allows. If

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -36,8 +37,9 @@ func (l *latencyTransport) AppendEntries(ctx context.Context, to int, args *Appe
 	return &AppendEntriesReply{Term: args.Term, Success: true}, true
 }
 
-// timeToCommit proposes n entries at once and returns how long until all are applied.
-func timeToCommit(t *testing.T, window, batch, n int) time.Duration {
+// timeToCommit proposes n entries at once and returns how long until all are
+// applied, and the most goroutines above the post-election level seen meanwhile.
+func timeToCommit(t *testing.T, window, batch, n int) (time.Duration, int) {
 	oldW, oldB, oldU := MaxInflightAppends, MaxAppendEntries, MaxUncommittedEntries
 	MaxInflightAppends, MaxAppendEntries, MaxUncommittedEntries = window, batch, 0
 	defer func() { MaxInflightAppends, MaxAppendEntries, MaxUncommittedEntries = oldW, oldB, oldU }()
@@ -49,6 +51,9 @@ func timeToCommit(t *testing.T, window, batch, n int) time.Duration {
 	}
 	defer r.Kill()
 	becomeLeader(t, r)
+	time.Sleep(100 * time.Millisecond)
+	base := runtime.NumGoroutine() // workers are already running
+	peak := base
 
 	start := time.Now()
 	for i := 1; i <= n; i++ {
@@ -61,6 +66,9 @@ func timeToCommit(t *testing.T, window, batch, n int) time.Duration {
 	for got < n {
 		select {
 		case m := <-applyCh:
+			if g := runtime.NumGoroutine(); g > peak {
+				peak = g
+			}
 			if m.CommandValid {
 				got++
 			}
@@ -68,16 +76,20 @@ func timeToCommit(t *testing.T, window, batch, n int) time.Duration {
 			t.Fatalf("window=%d: only %d/%d entries applied", window, got, n)
 		}
 	}
-	return time.Since(start)
+	return time.Since(start), peak - base
 }
 
 // A bigger window must raise throughput on a link with real latency: with
 // window 1 each batch costs a full round trip; with window 8 they overlap.
 func TestPipelineThroughput(t *testing.T) {
 	const n, batch = 600, 10
-	slow := timeToCommit(t, 1, batch, n)
-	fast := timeToCommit(t, 8, batch, n)
+	slow, slowG := timeToCommit(t, 1, batch, n)
+	fast, fastG := timeToCommit(t, 8, batch, n)
 	t.Logf("%d entries, batch %d, RTT 30ms: window=1 took %v, window=8 took %v (%.1fx)", n, batch, slow.Round(time.Millisecond), fast.Round(time.Millisecond), float64(slow)/float64(fast))
+	// Fixed worker pools: goroutines do not depend on how many requests are sent.
+	if slowG > 4 || fastG > 4 {
+		t.Errorf("goroutines grew with load: +%d (window 1), +%d (window 8) while sending hundreds of requests", slowG, fastG)
+	}
 	if slow < 3*fast {
 		t.Errorf("window=8 (%v) is not at least 3x faster than window=1 (%v)", fast, slow)
 	}

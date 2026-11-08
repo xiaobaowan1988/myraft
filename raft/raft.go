@@ -29,7 +29,30 @@ var (
 
 	// MaxAppendEntries caps the entries in one MsgApp (<= 0: no cap).
 	MaxAppendEntries = 128
+
+	// MaxAppendBytes caps the estimated size of one MsgApp's entries (<= 0: no cap),
+	// but a batch always carries at least one entry. Datagram transports want this
+	// small (a few KiB): every fragment of a message must arrive for it to count.
+	MaxAppendBytes = 64 << 10
+
+	// EntrySize estimates the bytes a command takes on the wire; it is only used to
+	// cap batches, so it need not be exact. Replace it if commands are not []byte
+	// or string.
+	EntrySize = func(cmd interface{}) int {
+		switch v := cmd.(type) {
+		case nil:
+			return 0
+		case []byte:
+			return len(v)
+		case string:
+			return len(v)
+		}
+		return 16
+	}
 )
+
+// entryOverhead is the estimated per-entry cost (term, length) added to EntrySize.
+const entryOverhead = 8
 
 // Raft is the I/O shell around the pure state machine (core), built like etcd's
 // raft.Node plus the application loop that drives it, with two goroutines:

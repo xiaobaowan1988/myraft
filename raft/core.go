@@ -377,9 +377,15 @@ func (c *core) sendBatch(peer int) {
 	if ni < 1 {
 		ni = 1
 	}
-	end := len(c.log)
-	if MaxAppendEntries > 0 && ni+MaxAppendEntries < end {
-		end = ni + MaxAppendEntries
+	// Take entries until the count or byte cap is reached, but always at least one.
+	end, size := ni, 0
+	for end < len(c.log) && (MaxAppendEntries <= 0 || end-ni < MaxAppendEntries) {
+		sz := entryOverhead + EntrySize(c.log[end].Command)
+		if end > ni && MaxAppendBytes > 0 && size+sz > MaxAppendBytes {
+			break
+		}
+		size += sz
+		end++
 	}
 	c.newRequest(peer, ni-1, append([]LogEntry(nil), c.log[ni:end]...))
 	if !c.probing[peer] {

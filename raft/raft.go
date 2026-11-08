@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,10 +25,19 @@ var (
 	MaxUncommittedEntries = 1024
 
 	// MaxInflightAppends is how many AppendEntries may be outstanding per follower
-	// once its log match is confirmed (1 while probing). It is also the number of
-	// fixed worker goroutines per follower, started once in Make, so it sets the
-	// resident goroutine count: 2 + (n-1)*(MaxInflightAppends+1).
-	MaxInflightAppends = 4
+	// once its log match is confirmed (1 while probing). It may exceed AppendWorkers:
+	// the extra requests wait in the follower's queue.
+	// Like etcd's rafthttp pipeline: fixed workers drain a bounded queue.
+	//
+	// AppendWorkers is the number of fixed worker goroutines per follower, started
+	// once in Make. Together with one vote worker per follower they set the resident
+	// goroutine count, 2 + (n-1)*(AppendWorkers+1), independent of load and window.
+	AppendWorkers = 4
+
+	// AppendQueueSize is the capacity of each follower's AppendEntries queue
+	// (etcd's pipelineBufSize). A full queue drops the request and reports it lost.
+	AppendQueueSize    = 64
+	MaxInflightAppends = 32
 
 	// MaxAppendEntries caps the entries in one AppendEntries (<= 0: no cap).
 	MaxAppendEntries = 128
@@ -67,23 +77,26 @@ type Raft struct {
 	peers []*peerQueues
 }
 
-// peerQueues feeds one follower's workers. Each in-flight AppendEntries has a
-// worker of its own (window == workers), so requests never wait in the queue
-// and their RPCTimeout is not eaten by queueing.
+// peerQueues feeds one follower's fixed workers. RPCTimeout runs from the moment
+// a worker starts the call, not from enqueueing (as in etcd's pipeline), so a
+// request's lifetime is its queue wait plus its call.
 type peerQueues struct {
 	appends chan appendJob
 	votes   chan voteJob
+	// gen is the newest request generation enqueued for this follower (written
+	// only by the event loop). Queued jobs of an older generation were made
+	// before the core reset this follower's pipeline and are skipped.
+	gen atomic.Uint64
 }
 
 type appendJob struct {
-	seq      uint64
-	args     *AppendEntriesArgs
-	deadline time.Time
+	seq  uint64
+	gen  uint64
+	args *AppendEntriesArgs
 }
 
 type voteJob struct {
-	args     *RequestVoteArgs
-	deadline time.Time
+	args *RequestVoteArgs
 }
 
 // restoreCore loads persistent state from st and builds the state machine.
@@ -118,9 +131,9 @@ func Make(me, n int, tr Transport, st Storage, applyCh chan ApplyMsg) (*Raft, er
 		if p == me {
 			continue
 		}
-		q := &peerQueues{appends: make(chan appendJob, c.window), votes: make(chan voteJob, 2)}
+		q := &peerQueues{appends: make(chan appendJob, max(AppendQueueSize, 1)), votes: make(chan voteJob, 2)}
 		r.peers[p] = q
-		for i := 0; i < c.window; i++ {
+		for i := 0; i < max(AppendWorkers, 1); i++ {
 			go r.appendWorker(p, q)
 		}
 		go r.voteWorker(p, q)
@@ -245,6 +258,15 @@ func (r *Raft) run() {
 // flush carries out the core's Ready in the only safe order:
 // persist -> send requests -> deliver apply -> release waiting RPC callers.
 func (r *Raft) flush() {
+	// Publish each follower's newest request generation to its queue first, so
+	// workers can tell queued requests made before a pipeline reset are stale.
+	if r.c.gen != nil {
+		for p, q := range r.peers {
+			if q != nil {
+				q.gen.Store(r.c.gen[p])
+			}
+		}
+	}
 	rd := r.c.takeReady()
 	if len(rd.Persist) > 0 {
 		if err := r.st.Append(rd.Persist); err != nil {
@@ -256,7 +278,7 @@ func (r *Raft) flush() {
 		r.sendVote(v.peer, v.args)
 	}
 	for _, a := range rd.Appends {
-		r.sendAppend(a.peer, a.seq, a.args)
+		r.sendAppend(a)
 	}
 	if len(rd.Apply) > 0 {
 		select {
@@ -274,20 +296,21 @@ func (r *Raft) flush() {
 // They run on the event loop and never block.
 func (r *Raft) sendVote(peer int, args *RequestVoteArgs) {
 	select {
-	case r.peers[peer].votes <- voteJob{args, time.Now().Add(RPCTimeout)}:
+	case r.peers[peer].votes <- voteJob{args}:
 	default:
 		// Queue full (the vote worker is stuck): drop it. Raft tolerates lost
 		// vote requests; the next election retries.
 	}
 }
 
-func (r *Raft) sendAppend(peer int, seq uint64, args *AppendEntriesArgs) {
+func (r *Raft) sendAppend(a appendOut) {
+	q := r.peers[a.peer]
 	select {
-	case r.peers[peer].appends <- appendJob{seq, args, time.Now().Add(RPCTimeout)}:
+	case q.appends <- appendJob{a.seq, a.gen, a.args}:
 	default:
-		// Cannot happen while in-flight <= window == queue capacity; if it ever
-		// does, treat the request as lost so its slot is freed.
-		r.c.onAppendLost(peer, seq)
+		// Queue full: drop and report the request lost, which makes the core fall
+		// back to probing (etcd: drop + ReportUnreachable).
+		r.c.onAppendLost(a.peer, a.seq)
 	}
 }
 
@@ -297,16 +320,24 @@ func (r *Raft) appendWorker(peer int, q *peerQueues) {
 		case <-r.done:
 			return
 		case j := <-q.appends:
-			ctx, cancel := context.WithDeadline(context.Background(), j.deadline)
-			var reply *AppendEntriesReply
-			ok := false
-			if ctx.Err() == nil {
-				reply, ok = r.tr.AppendEntries(ctx, peer, j.args)
+			if j.gen < q.gen.Load() {
+				continue // made before a pipeline reset; the core has forgotten it
 			}
+			// The timeout starts now, when the call starts, not when it was queued.
+			ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
+			reply, ok := r.tr.AppendEntries(ctx, peer, j.args)
 			cancel()
 			if !ok {
-				// Free the in-flight slot so the next heartbeat can retry.
-				r.post(func() { r.c.onAppendLost(peer, j.seq) })
+				// Free the in-flight slot so the next heartbeat can retry. Wait until the
+				// loop has handled it: the loss resets the pipeline and bumps the
+				// generation, and the next queued job must see that to be skipped.
+				handled := make(chan struct{})
+				if r.post(func() {
+					r.c.onAppendLost(peer, j.seq)
+					r.release(func() { close(handled) })
+				}) {
+					<-handled
+				}
 				continue
 			}
 			r.post(func() { r.c.onAppendReply(peer, j.seq, j.args, reply) })
@@ -320,12 +351,8 @@ func (r *Raft) voteWorker(peer int, q *peerQueues) {
 		case <-r.done:
 			return
 		case j := <-q.votes:
-			ctx, cancel := context.WithDeadline(context.Background(), j.deadline)
-			var reply *RequestVoteReply
-			ok := false
-			if ctx.Err() == nil {
-				reply, ok = r.tr.RequestVote(ctx, peer, j.args)
-			}
+			ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
+			reply, ok := r.tr.RequestVote(ctx, peer, j.args)
 			cancel()
 			if ok {
 				r.post(func() { r.c.onVoteReply(peer, j.args.Term, reply) })

@@ -106,9 +106,9 @@ func TestInFlightBounded(t *testing.T) {
 		honorCtx bool
 	}{{"transport honors ctx", true}, {"transport ignores ctx", false}} {
 		t.Run(tc.name, func(t *testing.T) {
-			old := MaxInflightAppends
-			MaxInflightAppends = 4
-			defer func() { MaxInflightAppends = old }()
+			old := AppendWorkers
+			AppendWorkers = 4
+			defer func() { AppendWorkers = old }()
 			res := runStuck(t, tc.honorCtx)
 			tr := res.tr
 			const n, workers = 3, 4

@@ -49,7 +49,13 @@ type core struct {
 	probing []bool
 	pending [][]uint64
 	seq     uint64
-	window  int // MaxInflightAppends, fixed at construction (the shell sizes its worker pools from it)
+	window  int // MaxInflightAppends, fixed at construction
+	// gen[p] is a generation stamp for peer p's requests. It comes from one
+	// monotone counter and is renewed whenever the pipeline is reset (and on
+	// election), so a shell that queues requests can recognise and skip ones
+	// made before the reset, which the core has already forgotten.
+	gen    []uint64
+	genCtr uint64
 
 	granted          []bool // granted[p]: peer p voted for us in the current election (dedups duplicate replies)
 	electionDeadline time.Time
@@ -66,6 +72,7 @@ type voteOut struct {
 type appendOut struct {
 	peer int
 	seq  uint64
+	gen  uint64
 	args *AppendEntriesArgs
 }
 
@@ -143,8 +150,11 @@ func (c *core) becomeLeader() {
 	c.matchIndex = make([]int, c.n)
 	c.probing = make([]bool, c.n)
 	c.pending = make([][]uint64, c.n)
+	c.gen = make([]uint64, c.n)
 	for i := range c.probing {
 		c.probing[i] = true
+		c.genCtr++
+		c.gen[i] = c.genCtr
 	}
 	for i := range c.nextIndex {
 		c.nextIndex[i] = len(c.log)
@@ -330,7 +340,7 @@ func (c *core) newRequest(peer int, prev int, entries []LogEntry) {
 	}
 	c.seq++
 	c.pending[peer] = append(c.pending[peer], c.seq)
-	c.rd.Appends = append(c.rd.Appends, appendOut{peer, c.seq, args})
+	c.rd.Appends = append(c.rd.Appends, appendOut{peer, c.seq, c.gen[peer], args})
 }
 
 // sendBatch sends the next batch starting at nextIndex. While replicating it
@@ -378,6 +388,8 @@ func (c *core) release(peer int, seq uint64) bool {
 func (c *core) resetToProbe(peer, next int) {
 	c.probing[peer] = true
 	c.pending[peer] = nil
+	c.genCtr++
+	c.gen[peer] = c.genCtr
 	if next < c.matchIndex[peer]+1 {
 		next = c.matchIndex[peer] + 1
 	}

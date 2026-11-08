@@ -133,21 +133,46 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
   - 问题：此前每个 RPC 起一个临时协程，协程数随负载浮动；窗口调大后上界 `(n-1)×窗口` 也随之变大。
   - `Make` 时为每个 follower 一次性启动：`窗口` 个 AppendEntries worker + 1 个投票 worker，之后协程数与负载无关。
     发送只是把任务放进该 peer 的有缓冲 channel；worker 取任务、调用 `Transport`、再把结果作为事件投回事件循环。
-  - **窗口 = worker 数**（窗口在构造 `core` 时固定下来并传给外壳）：每个在途请求都有现成的 worker，不会在队列里排队耗掉
-    `RPCTimeout`。不采用 etcd 的"队列大于 worker 数"：排队的请求会超时、触发回到探测，慢网络下更差。
-  - 默认 `MaxInflightAppends` 由 8 降为 4（与 etcd 的 `connPerPipeline` 一致），常驻协程 = `2 + (n-1)×(窗口+1)`（n=5 为 22）。
-  - 队列满（理论上不会发生，因为在途数 ≤ 窗口 ≤ 队列容量）的兜底：AppendEntries 按"丢失"处理；投票请求直接丢弃（Raft 容忍丢失）。
+  - （阶段 12 最初让窗口 = worker 数、不排队；该设计已被阶段 13 取代，以与 etcd 对齐。）
   - 投票 worker 独立于 AppendEntries worker，避免投票被卡住的复制请求拖慢。
   - 仍然要求 Transport 遵守 ctx：无视 ctx 的调用会永久占住一个 worker（探测状态下一个 follower 只会占 1 个）。
-  - 测试：`TestInFlightBounded` 改为断言协程数 ≤ 常驻上界 + 少量计时器噪声，且**不随时间增长**；
+  - 测试：`TestInFlightBounded` 断言协程数 ≤ 常驻上界 + 少量计时器噪声，且**不随时间增长**；
     `TestPipelineThroughput` 额外断言处理 600 条提案期间协程数几乎不变（证明没有逐请求协程）。
-  - 注意：模拟器不建模 worker 与队列（它按"发送时刻起算超时"，与外壳语义等价，因为窗口 = worker 数不排队）；
-    worker 的启动/停止、队列兜底只由外壳测试覆盖。
   - 验证结果：3 节点、对端永不应答时协程数稳定在常驻上界附近（实测 15–16，上界 12 + 少量计时器协程），
     前后两个 1 秒窗口持平；600 条提案、窗口 8 期间协程数几乎不变，吞吐仍约 6.8 倍。
     变异验证：把 `sendAppend` 改回"每请求一个协程"，`TestPipelineThroughput` 失败（窗口 8 时协程多出 26 个）。
     模拟器 2000 个种子、`go test -race` 全部通过。
   - 代价：常驻协程增加（n=5、窗口 4 时每节点 22 个，空闲时也在），换取与负载无关的确定上界。
+
+- [x] **13. 与 etcd 对齐：worker 数 < 队列容量 < 窗口上限（取代阶段 12 的"窗口 = worker 数"）**：
+  - etcd rafthttp pipeline：固定 4 个 worker 从带缓冲（64）的队列取消息；**超时从 worker 开始调用时算起**（入队时不计时）；
+    调用失败 → `ReportUnreachable`（raft 退回探测）并继续取下一条；队列满 → 丢弃并 `ReportUnreachable`。
+  - 三个独立参数：`AppendWorkers`（默认 4，决定常驻协程）、`AppendQueueSize`（默认 64，对应 `pipelineBufSize`）、
+    `MaxInflightAppends`（默认 32，核心的窗口上限，可大于 worker 数，多出的请求排队）。
+    常驻协程 = `2 + (n-1)×(AppendWorkers+1)`，与窗口大小无关（n=5 为 22）。
+  - `RPCTimeout` 现在从 worker 开始调用时起算；请求总寿命 = 排队时间 + 调用时间，
+    因此 `STUCK SLOT` 不变量的上界改为 `(ceil(窗口/worker数)+1) × RPCTimeout`。
+  - 队列满：AppendEntries 按"丢失"处理（核心 `onAppendLost` → 退回探测，对应 etcd 的丢弃并上报不可达）；
+    投票请求直接丢弃（Raft 容忍丢失）。投票 worker 仍独立（1 个，队列 2）。
+    注：队列满时是否上报丢失不影响活性——不上报只会在窗口里留下"幽灵名额"（最多 `窗口-(worker+队列)` 个，
+    真实可用名额始终 ≥ worker+队列），被丢弃的日志会在下一次因断档被拒绝后重发；上报则让核心立即重发。
+  - **过期任务跳过（etcd 没有，为避免排队带来的新问题而增加）**：核心为每个 follower 维护单调递增的"代数"，
+    每次退回探测或当选时更新；每个请求带当时的代数。外壳在入队时记下该 follower 的最新代数，worker 出队时
+    发现任务代数更旧就直接丢弃（核心早已忘记它，无需事件）。否则退回探测后，新的探测请求会排在最多
+    `AppendQueueSize` 个已失效的旧请求后面。
+  - 模拟器现在**建模 worker 池与队列**（每节点每 follower：K 个 worker、容量 Q 的 FIFO、队列满即丢、代数跳过、
+    超时从开始调用起算，worker 在应答或超时时释放）；K、Q 与窗口按种子变化。
+  - 验证：外壳测试 `TestQueueFullDropsAndRecovers`（队列满丢弃后恢复，并发不超过 worker 数，协程不增长）、
+    `TestStaleQueuedRequestsSkipped`（重置后队列里的旧请求被跳过；去掉跳过、或去掉"等事件循环处理完丢失事件"都会失败，
+    后者说明那个竞态是真实的）、`TestQueueOverflowWithSlowFollowerKeepsReplicating`、`TestPipelineThroughput`
+    （窗口 8/worker 8 约 6.9 倍；窗口 32/worker 4 约 2.6 倍——提案逐条到达时先塞满 32 个只带 1 条日志的小请求，
+    worker 每个往返只处理 4 个，所以窗口大于 worker 数并不带来成比例的收益）。
+  - 模拟器覆盖统计（300 种子）：排队约 3.4 万次、队列满丢弃约 2400 次、过期跳过约 1.1 万次，三条路径都被要求触发过。
+    模拟器里过期跳过比外壳更确定：它在处理完应答并 flush 之后才释放 worker；外壳只在"丢失"路径上等待事件循环，
+    "拒绝应答"路径上 worker 不等待，偶尔会多执行一个过期请求（浪费一次调用，不影响正确性）。
+  - 仍与 etcd 不同：etcd 的主路径是**流**（msgAppV2 流 + 消息流，写协程顺序发送，应答作为反向流里的独立消息），
+    pipeline 只是降级通道和快照通道；本项目的 `Transport` 是请求/应答式 RPC，worker 池对应 etcd 的 pipeline，
+    不改造为流式异步消息。
 
 ## 与原指南的有意偏差（原因）
 

@@ -1,63 +1,28 @@
 package raft
 
 import (
-	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// gatedTransport models a 3-node cluster from node 0's side: peer 1 grants
-// votes, and AppendEntries to either peer fails (blocks until timeout) while
-// the gate is closed, or succeeds once it is open.
-type gatedTransport struct{ open atomic.Bool }
-
-func (g *gatedTransport) RequestVote(ctx context.Context, to int, args *RequestVoteArgs) (*RequestVoteReply, bool) {
-	if to == 1 {
-		return &RequestVoteReply{Term: args.Term, VoteGranted: true}, true
-	}
-	<-ctx.Done()
-	return nil, false
-}
-
-func (g *gatedTransport) AppendEntries(ctx context.Context, to int, args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
-	if g.open.Load() {
-		return &AppendEntriesReply{Term: args.Term, Success: true}, true
-	}
-	<-ctx.Done()
-	return nil, false
-}
-
-func setMaxUncommitted(t *testing.T, n int) {
-	old := MaxUncommittedEntries
-	MaxUncommittedEntries = n
-	t.Cleanup(func() { MaxUncommittedEntries = old })
-}
-
-func becomeLeader(t *testing.T, r *Raft) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, isL := r.State(); isL {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("never became leader")
-}
-
 // A leader that cannot commit must stop accepting proposals at the limit, so
 // its log stays bounded; once commits resume it accepts again.
 func TestProposalBackpressure(t *testing.T) {
 	const limit = 10
 	setMaxUncommitted(t, limit)
-	tr := &gatedTransport{}
-	r, err := Make(0, 3, tr, &MemStorage{}, make(chan ApplyMsg, 1024))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Kill()
+	var open atomic.Bool // while closed, followers never answer MsgApp
+	f := &fakePeers{handle: func(m Message) []Message {
+		if r := voteFromPeer1(m); r != nil {
+			return r
+		}
+		if open.Load() {
+			return ackApp(m)
+		}
+		return nil
+	}}
+	r := startNode(t, f, make(chan ApplyMsg, 1024))
 	becomeLeader(t, r)
 
 	// The election no-op is uncommitted and counts, so exactly limit-1 fit.
@@ -78,7 +43,7 @@ func TestProposalBackpressure(t *testing.T) {
 	}
 
 	// Let replication succeed: entries commit, room opens up, proposals work again.
-	tr.open.Store(true)
+	open.Store(true)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if _, _, err := r.Propose("after-recovery"); err == nil {
@@ -94,8 +59,7 @@ func TestProposalBackpressure(t *testing.T) {
 }
 
 func TestProposeErrors(t *testing.T) {
-	tr := &gatedTransport{}
-	r, err := Make(0, 3, tr, &MemStorage{}, make(chan ApplyMsg, 8))
+	r, err := Make(0, 3, &fakePeers{}, &MemStorage{}, make(chan ApplyMsg, 8))
 	if err != nil {
 		t.Fatal(err)
 	}

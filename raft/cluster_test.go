@@ -37,6 +37,7 @@ func newCluster(t *testing.T, n int) *cluster {
 		for i := 0; i < n; i++ {
 			c.crash(i)
 		}
+		c.net.Close()
 	})
 	return c
 }
@@ -299,6 +300,7 @@ func TestChaos(t *testing.T) {
 	c := newCluster(t, 5)
 	c.waitLeader(0, 1, 2, 3, 4)
 	c.net.SetChaos(0.15, 20*time.Millisecond, 0.05, 500*time.Millisecond)
+	c.net.SetDup(0.05)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -352,6 +354,7 @@ func TestChaos(t *testing.T) {
 	// Heal everything: system must be live again.
 	c.net.Heal()
 	c.net.SetChaos(0, 0, 0, 0)
+	c.net.SetDup(0)
 	for i := range down {
 		c.restart(i)
 	}

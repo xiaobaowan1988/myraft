@@ -7,14 +7,15 @@ import (
 
 // core is the Raft state machine. It performs NO I/O: it never touches
 // storage, the network, channels, goroutines or the wall clock. Callers drive
-// it with events (tick, incoming RPCs, RPC replies, proposals); everything it
-// wants done in response accumulates in c.rd and is collected with takeReady.
+// it with events (tick, incoming messages, unreachable reports, proposals);
+// everything it wants done in response accumulates in c.rd and is collected
+// with takeReady.
 //
 // The driver MUST process a Ready in this order: persist Persist records
-// (durably) first, and only then send messages, deliver Apply entries, and
-// answer the RPC that triggered the event. That ordering is what makes the
-// state safe to reveal; it is enforced in one place (Raft.flush and the
-// simulator's flush) instead of inside every handler.
+// (durably) first, and only then send Messages and deliver Apply entries. That
+// ordering is what makes the state safe to reveal - including answers to
+// incoming messages, which are just entries in Messages - and it is enforced in
+// one place (Raft.flush and the simulator's flush) instead of inside every handler.
 //
 // core is not safe for concurrent use: exactly one goroutine may call it.
 type core struct {
@@ -42,50 +43,39 @@ type core struct {
 	// Per-follower replication progress (like etcd/raft's Progress).
 	//   probing[p]: nextIndex is unconfirmed, so only one request may be outstanding.
 	//   otherwise (replicating): nextIndex is advanced optimistically when sending and up
-	//   to MaxInflightAppends requests may be outstanding.
-	// pending[p] holds the seqs of outstanding requests, oldest first. A reply or
-	// loss event only counts as "current" if its seq is still in pending[p]; any
-	// reset to probing empties it, which makes older replies stale.
+	//   to window requests may be outstanding.
+	// pending[p] holds the outstanding MsgApp requests, oldest first. An answer only
+	// counts as "current" if its Seq is still in pending[p]; any reset to probing
+	// empties it, which makes older answers stale. A request that stays unanswered
+	// for AppendTimeout is treated as lost and also resets to probing.
 	probing []bool
-	pending [][]uint64
+	pending [][]pendReq
 	seq     uint64
 	window  int // MaxInflightAppends, fixed at construction
-	// gen[p] is a generation stamp for peer p's requests. It comes from one
-	// monotone counter and is renewed whenever the pipeline is reset (and on
-	// election), so a shell that queues requests can recognise and skip ones
-	// made before the reset, which the core has already forgotten.
-	gen    []uint64
-	genCtr uint64
 
-	granted          []bool // granted[p]: peer p voted for us in the current election (dedups duplicate replies)
+	granted          []bool // granted[p]: peer p voted for us in the current election (dedups duplicate answers)
 	electionDeadline time.Time
 	lastBroadcast    time.Time
 
 	rd Ready // output accumulated since the last takeReady
 }
 
-type voteOut struct {
-	peer int
-	args *RequestVoteArgs
-}
-
-type appendOut struct {
-	peer int
+// pendReq is a MsgApp the leader has sent and not yet seen answered.
+type pendReq struct {
 	seq  uint64
-	gen  uint64
-	args *AppendEntriesArgs
+	at   time.Time
+	prev int // the request's PrevLogIndex
 }
 
 // Ready is what the state machine asks its driver to do.
 type Ready struct {
-	Persist []Record // make durable BEFORE anything below becomes visible
-	Votes   []voteOut
-	Appends []appendOut
-	Apply   []ApplyMsg
+	Persist  []Record  // make durable BEFORE anything below becomes visible
+	Messages []Message // to send, in order
+	Apply    []ApplyMsg
 }
 
 func (rd *Ready) empty() bool {
-	return len(rd.Persist) == 0 && len(rd.Votes) == 0 && len(rd.Appends) == 0 && len(rd.Apply) == 0
+	return len(rd.Persist) == 0 && len(rd.Messages) == 0 && len(rd.Apply) == 0
 }
 
 // takeReady returns and clears the accumulated output.
@@ -115,6 +105,12 @@ func (c *core) stage(recs ...Record) { c.rd.Persist = append(c.rd.Persist, recs.
 
 func (c *core) stageMeta() {
 	c.stage(Record{Kind: recMeta, Term: c.currentTerm, VotedFor: c.votedFor})
+}
+
+// send queues a message; the driver sends it after persisting.
+func (c *core) send(m Message) {
+	m.From = c.me
+	c.rd.Messages = append(c.rd.Messages, m)
 }
 
 func (c *core) resetElection() {
@@ -149,12 +145,9 @@ func (c *core) becomeLeader() {
 	c.nextIndex = make([]int, c.n)
 	c.matchIndex = make([]int, c.n)
 	c.probing = make([]bool, c.n)
-	c.pending = make([][]uint64, c.n)
-	c.gen = make([]uint64, c.n)
+	c.pending = make([][]pendReq, c.n)
 	for i := range c.probing {
 		c.probing[i] = true
-		c.genCtr++
-		c.gen[i] = c.genCtr
 	}
 	for i := range c.nextIndex {
 		c.nextIndex[i] = len(c.log)
@@ -217,11 +210,45 @@ func (c *core) propose(cmd interface{}) (index, term int, err error) {
 
 func (c *core) onTick() {
 	if c.state == Leader {
+		// A request unanswered for AppendTimeout is lost: the pipeline can no longer
+		// be trusted, so restart probing from the known match. pending is oldest first.
+		for p := 0; p < c.n; p++ {
+			if p != c.me && len(c.pending[p]) > 0 && c.now().Sub(c.pending[p][0].at) > AppendTimeout {
+				c.resetToProbe(p, c.matchIndex[p]+1)
+			}
+		}
 		if c.now().Sub(c.lastBroadcast) >= HeartbeatInterval {
 			c.broadcast(true)
 		}
 	} else if c.now().After(c.electionDeadline) {
 		c.startElection()
+	}
+}
+
+// onUnreachable is the transport reporting that sending to peer failed (a broken
+// connection). Like a timeout, it makes replication to peer restart from a safe point.
+func (c *core) onUnreachable(peer int) {
+	if c.state == Leader && peer >= 0 && peer < c.n && peer != c.me {
+		c.resetToProbe(peer, c.matchIndex[peer]+1)
+	}
+}
+
+// ---- messages ----
+
+// step handles one incoming message.
+func (c *core) step(m Message) {
+	if m.To != c.me || m.From < 0 || m.From >= c.n || m.From == c.me {
+		return // not for us, or from nobody we know
+	}
+	switch m.Type {
+	case MsgVote:
+		c.handleVote(m)
+	case MsgVoteResp:
+		c.onVoteResp(m)
+	case MsgApp:
+		c.handleApp(m)
+	case MsgAppResp:
+		c.onAppResp(m)
 	}
 }
 
@@ -233,32 +260,30 @@ func (c *core) startElection() {
 	c.votedFor = c.me
 	c.stageMeta()
 	c.resetElection()
-	term := c.currentTerm
 	if c.n == 1 {
 		c.becomeLeader()
 		return
 	}
 	lastIdx := len(c.log) - 1
-	args := &RequestVoteArgs{Term: term, CandidateID: c.me, LastLogIndex: lastIdx, LastLogTerm: c.log[lastIdx].Term}
 	c.granted = make([]bool, c.n)
 	c.granted[c.me] = true
 	for peer := 0; peer < c.n; peer++ {
 		if peer != c.me {
-			c.rd.Votes = append(c.rd.Votes, voteOut{peer, args})
+			c.send(Message{Type: MsgVote, To: peer, Term: c.currentTerm, LastLogIndex: lastIdx, LastLogTerm: c.log[lastIdx].Term})
 		}
 	}
 }
 
-func (c *core) onVoteReply(peer, term int, reply *RequestVoteReply) {
-	if reply.Term > c.currentTerm {
-		c.becomeFollower(reply.Term)
+func (c *core) onVoteResp(m Message) {
+	if m.Term > c.currentTerm {
+		c.becomeFollower(m.Term)
 		return
 	}
-	if c.state != Candidate || c.currentTerm != term {
-		return // stale reply
+	if c.state != Candidate || c.currentTerm != m.Term {
+		return // stale answer
 	}
-	if reply.VoteGranted && !c.granted[peer] {
-		c.granted[peer] = true
+	if m.Granted && !c.granted[m.From] {
+		c.granted[m.From] = true
 		votes := 0
 		for _, g := range c.granted {
 			if g {
@@ -271,24 +296,26 @@ func (c *core) onVoteReply(peer, term int, reply *RequestVoteReply) {
 	}
 }
 
-func (c *core) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	reply.Term = c.currentTerm
-	if args.Term < c.currentTerm {
+func (c *core) handleVote(m Message) {
+	resp := Message{Type: MsgVoteResp, To: m.From, Term: c.currentTerm}
+	if m.Term < c.currentTerm {
+		c.send(resp)
 		return
 	}
-	if args.Term > c.currentTerm {
-		c.becomeFollower(args.Term)
-		reply.Term = c.currentTerm
+	if m.Term > c.currentTerm {
+		c.becomeFollower(m.Term)
+		resp.Term = c.currentTerm
 	}
 	lastIdx := len(c.log) - 1
 	lastTerm := c.log[lastIdx].Term
-	upToDate := args.LastLogTerm > lastTerm || (args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIdx)
-	if (c.votedFor == -1 || c.votedFor == args.CandidateID) && upToDate {
-		c.votedFor = args.CandidateID
-		c.stageMeta() // the driver persists this before the reply can leave
+	upToDate := m.LastLogTerm > lastTerm || (m.LastLogTerm == lastTerm && m.LastLogIndex >= lastIdx)
+	if (c.votedFor == -1 || c.votedFor == m.From) && upToDate {
+		c.votedFor = m.From
+		c.stageMeta() // the driver persists this before the answer can leave
 		c.resetElection()
-		reply.VoteGranted = true
+		resp.Granted = true
 	}
+	c.send(resp)
 }
 
 // ---- replication ----
@@ -307,7 +334,7 @@ func (c *core) broadcast(heartbeat bool) {
 }
 
 // canSend reports whether peer's window has room: one request while probing,
-// up to MaxInflightAppends while replicating.
+// up to window while replicating.
 func (c *core) canSend(peer int) bool {
 	if c.probing[peer] {
 		return len(c.pending[peer]) == 0
@@ -332,20 +359,19 @@ func (c *core) replicate(peer int, heartbeat bool) {
 }
 
 func (c *core) newRequest(peer int, prev int, entries []LogEntry) {
-	args := &AppendEntriesArgs{
-		Term: c.currentTerm, LeaderID: c.me,
+	c.seq++
+	c.pending[peer] = append(c.pending[peer], pendReq{seq: c.seq, at: c.now(), prev: prev})
+	c.send(Message{
+		Type: MsgApp, To: peer, Term: c.currentTerm, Seq: c.seq,
 		PrevLogIndex: prev, PrevLogTerm: c.log[prev].Term,
 		Entries:      entries,
 		LeaderCommit: c.commitIndex,
-	}
-	c.seq++
-	c.pending[peer] = append(c.pending[peer], c.seq)
-	c.rd.Appends = append(c.rd.Appends, appendOut{peer, c.seq, c.gen[peer], args})
+	})
 }
 
 // sendBatch sends the next batch starting at nextIndex. While replicating it
 // optimistically advances nextIndex past the batch so the next one can follow
-// without waiting for this reply.
+// without waiting for its answer.
 func (c *core) sendBatch(peer int) {
 	ni := c.nextIndex[peer]
 	if ni < 1 {
@@ -361,35 +387,33 @@ func (c *core) sendBatch(peer int) {
 	}
 }
 
-// sendHeartbeat sends an empty AppendEntries anchored at matchIndex, a position
-// already known to match, so reordering or in-flight batches cannot make it fail.
+// sendHeartbeat sends an empty MsgApp anchored at matchIndex, a position already
+// known to match, so reordering or in-flight batches cannot make it fail.
 func (c *core) sendHeartbeat(peer int) {
 	c.newRequest(peer, c.matchIndex[peer], nil)
 }
 
-// release removes seq from peer's outstanding set and reports whether it was
-// there, i.e. whether the reply/loss is current rather than stale.
-func (c *core) release(peer int, seq uint64) bool {
+// release removes seq from peer's outstanding set and returns the request and
+// whether it was there, i.e. whether the answer is current rather than stale.
+func (c *core) release(peer int, seq uint64) (pendReq, bool) {
 	if c.state != Leader {
-		return false
+		return pendReq{}, false
 	}
 	p := c.pending[peer]
-	for i, s := range p {
-		if s == seq {
+	for i, r := range p {
+		if r.seq == seq {
 			c.pending[peer] = append(p[:i:i], p[i+1:]...)
-			return true
+			return r, true
 		}
 	}
-	return false
+	return pendReq{}, false
 }
 
-// resetToProbe drops all outstanding requests of peer (their replies become
-// stale) and returns it to one-at-a-time probing from nextIndex.
+// resetToProbe drops all outstanding requests of peer (their answers become
+// stale) and returns it to one-at-a-time probing from next.
 func (c *core) resetToProbe(peer, next int) {
 	c.probing[peer] = true
 	c.pending[peer] = nil
-	c.genCtr++
-	c.gen[peer] = c.genCtr
 	if next < c.matchIndex[peer]+1 {
 		next = c.matchIndex[peer] + 1
 	}
@@ -399,30 +423,24 @@ func (c *core) resetToProbe(peer, next int) {
 	c.nextIndex[peer] = next
 }
 
-// onAppendLost handles a timed-out or lost AppendEntries. If it was current,
-// the pipeline can no longer be trusted: restart probing from the known match.
-// The next heartbeat retries.
-func (c *core) onAppendLost(peer int, seq uint64) {
-	if c.release(peer, seq) {
-		c.resetToProbe(peer, c.matchIndex[peer]+1)
-	}
-}
-
-func (c *core) onAppendReply(peer int, seq uint64, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if reply.Term > c.currentTerm {
-		c.becomeFollower(reply.Term)
+func (c *core) onAppResp(m Message) {
+	if m.Term > c.currentTerm {
+		c.becomeFollower(m.Term)
 		c.resetElection()
 		return
 	}
-	if c.state != Leader || c.currentTerm != args.Term {
-		return // stale reply
+	if c.state != Leader || c.currentTerm != m.Term {
+		return // stale answer
 	}
-	current := c.release(peer, seq)
-	prev := args.PrevLogIndex
-	if reply.Success {
-		// Valid even for a stale reply: within this term the follower really
-		// holds the leader's log up to match.
-		match := prev + len(args.Entries)
+	peer := m.From
+	pr, current := c.release(peer, m.Seq)
+	if m.Success {
+		// Valid even for a stale answer: within this term the follower really
+		// holds the leader's log up to Match.
+		match := m.Match
+		if match >= len(c.log) {
+			return // cannot match beyond our own log: malformed
+		}
 		if match > c.matchIndex[peer] {
 			c.matchIndex[peer] = match
 		}
@@ -439,15 +457,15 @@ func (c *core) onAppendReply(peer int, seq uint64, args *AppendEntriesArgs, repl
 	if !current {
 		return // a rejection from before the last reset says nothing new
 	}
-	ni := prev + 1
-	next := reply.ConflictIndex
-	if reply.ConflictTerm != -1 {
+	ni := pr.prev + 1
+	next := m.ConflictIndex
+	if m.ConflictTerm != -1 {
 		for i := len(c.log) - 1; i >= 1; i-- {
-			if c.log[i].Term == reply.ConflictTerm {
+			if c.log[i].Term == m.ConflictTerm {
 				next = i + 1
 				break
 			}
-			if c.log[i].Term < reply.ConflictTerm {
+			if c.log[i].Term < m.ConflictTerm {
 				break
 			}
 		}
@@ -461,52 +479,57 @@ func (c *core) onAppendReply(peer int, seq uint64, args *AppendEntriesArgs, repl
 	}
 }
 
-func (c *core) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	reply.Term = c.currentTerm
-	if args.Term < c.currentTerm {
-		return // stale leader
-	}
-	c.becomeFollower(args.Term) // also demotes a same-term candidate
-	reply.Term = c.currentTerm
-	c.resetElection()
-
-	if args.PrevLogIndex >= len(c.log) {
-		reply.ConflictIndex, reply.ConflictTerm = len(c.log), -1
+func (c *core) handleApp(m Message) {
+	resp := Message{Type: MsgAppResp, To: m.From, Seq: m.Seq, Term: c.currentTerm}
+	if m.Term < c.currentTerm || m.PrevLogIndex < 0 {
+		c.send(resp) // stale leader (it learns our term) or malformed
 		return
 	}
-	if t := c.log[args.PrevLogIndex].Term; t != args.PrevLogTerm {
-		reply.ConflictTerm = t
-		i := args.PrevLogIndex
+	c.becomeFollower(m.Term) // also demotes a same-term candidate
+	resp.Term = c.currentTerm
+	c.resetElection()
+
+	if m.PrevLogIndex >= len(c.log) {
+		resp.ConflictIndex, resp.ConflictTerm = len(c.log), -1
+		c.send(resp)
+		return
+	}
+	if t := c.log[m.PrevLogIndex].Term; t != m.PrevLogTerm {
+		resp.ConflictTerm = t
+		i := m.PrevLogIndex
 		for i > 1 && c.log[i-1].Term == t {
 			i--
 		}
-		reply.ConflictIndex = i
+		resp.ConflictIndex = i
+		c.send(resp)
 		return
 	}
 
 	// Truncate only on a real conflict; matching entries (duplicates or
-	// reordered RPCs) are left alone.
-	for i, e := range args.Entries {
-		idx := args.PrevLogIndex + 1 + i
+	// reordered messages) are left alone.
+	for i, e := range m.Entries {
+		idx := m.PrevLogIndex + 1 + i
 		if idx < len(c.log) {
 			if c.log[idx].Term == e.Term {
 				continue
 			}
 			c.log = c.log[:idx]
 		}
-		rest := append([]LogEntry(nil), args.Entries[i:]...)
+		rest := append([]LogEntry(nil), m.Entries[i:]...)
 		c.log = append(c.log, rest...)
 		c.stage(Record{Kind: recAppend, Index: idx, Entries: rest})
 		break
 	}
 
-	lastNew := args.PrevLogIndex + len(args.Entries)
-	if args.LeaderCommit > c.commitIndex {
-		cm := args.LeaderCommit
+	lastNew := m.PrevLogIndex + len(m.Entries)
+	if m.LeaderCommit > c.commitIndex {
+		cm := m.LeaderCommit
 		if lastNew < cm {
 			cm = lastNew
 		}
 		c.setCommit(cm)
 	}
-	reply.Success = true
+	resp.Success = true
+	resp.Match = lastNew
+	c.send(resp)
 }

@@ -54,11 +54,6 @@ func (h *eventHeap) Pop() any {
 
 // ---- simulator ----
 
-type sentKey struct {
-	node, epoch int
-	seq         uint64
-}
-
 type detSim struct {
 	seed int64
 	rng  *rand.Rand
@@ -88,20 +83,19 @@ type detSim struct {
 	failures []string
 
 	// invariant bookkeeping
-	leaderOf              map[int]int // term -> leader id
-	committed             []LogEntry  // index -> first entry seen committed (Term 0 = unknown)
-	commitTerm            []int       // index -> term in which it was first committed (the committing leader's term)
-	seenCommit            []int
-	maxTerm               []int
-	applied               []map[int]interface{}
-	appliedAny            map[int]interface{}
-	expectApply           []int
-	nextCmd               int
-	rejected              int                       // proposals refused by the uncommitted-entries limit
-	queued, full, skipped int                       // worker-pool coverage: jobs that waited, were dropped on a full queue, or were skipped as stale
-	sentAt                map[sentKey]time.Duration // when each AppendEntries was handed to its worker pool
-	pools                 [][]*simPool              // [node][peer] AppendEntries worker pools
-	vpools                [][]*simPool              // [node][peer] vote worker pools
+	leaderOf       map[int]int // term -> leader id
+	committed      []LogEntry  // index -> first entry seen committed (Term 0 = unknown)
+	commitTerm     []int       // index -> term in which it was first committed (the committing leader's term)
+	seenCommit     []int
+	maxTerm        []int
+	applied        []map[int]interface{}
+	appliedAny     map[int]interface{}
+	expectApply    []int
+	nextCmd        int
+	rejected       int      // proposals refused by the uncommitted-entries limit
+	unreachPending [][]bool // [from][to] an unreachable report is already queued
+	// coverage counters
+	unreachables, timeouts, maxPipe int
 }
 
 func newDetSim(seed int64, dump bool) *detSim {
@@ -116,11 +110,10 @@ func newDetSim(seed int64, dump bool) *detSim {
 		leaderOf: map[int]int{}, seenCommit: make([]int, n), maxTerm: make([]int, n),
 		applied: make([]map[int]interface{}, n), appliedAny: map[int]interface{}{},
 		expectApply: make([]int, n), nextCmd: 1000,
-		sentAt: map[sentKey]time.Duration{},
-		pools:  make([][]*simPool, n), vpools: make([][]*simPool, n),
+		unreachPending: make([][]bool, n),
 	}
 	for i := 0; i < n; i++ {
-		s.pools[i], s.vpools[i] = make([]*simPool, n), make([]*simPool, n)
+		s.unreachPending[i] = make([]bool, n)
 		s.stores[i] = &MemStorage{}
 		s.applied[i] = map[int]interface{}{}
 		s.boot(i)
@@ -141,6 +134,11 @@ func (s *detSim) after(d time.Duration, desc string, fn func()) {
 
 func (s *detSim) reach(a, b int) bool { return s.up[a] && s.up[b] && s.group[a] == s.group[b] }
 
+// arrives reports whether a message already sent a->b still gets through. Unlike
+// reach it does not need the sender to be alive: a packet on the wire is not
+// recalled when its sender crashes.
+func (s *detSim) arrives(a, b int) bool { return s.up[b] && s.group[a] == s.group[b] }
+
 // boot (re)starts node i from its stored state.
 func (s *detSim) boot(i int) {
 	s.epoch[i]++
@@ -151,7 +149,6 @@ func (s *detSim) boot(i int) {
 		return
 	}
 	s.nodes[i], s.up[i] = r, true
-	s.newPools(i)
 	s.expectApply[i], s.seenCommit[i] = 1, 0
 	s.tickLoop(i, ep)
 }
@@ -166,7 +163,22 @@ func (s *detSim) tickLoop(i, ep int) {
 		if s.epoch[i] != ep || !s.up[i] {
 			return
 		}
+		// Coverage: an onTick that empties a follower's outstanding set did so by timeout.
+		var before []int
+		if nd := s.nodes[i]; nd.state == Leader {
+			before = make([]int, s.n)
+			for p := range before {
+				before[p] = len(nd.pending[p])
+			}
+		}
 		s.nodes[i].onTick()
+		if before != nil && s.nodes[i].state == Leader {
+			for p := range before {
+				if p != i && before[p] > 0 && len(s.nodes[i].pending[p]) == 0 {
+					s.timeouts++
+				}
+			}
+		}
 		if !s.flush(i) {
 			return
 		}
@@ -185,135 +197,51 @@ func (s *detSim) delay() time.Duration {
 	return d
 }
 
-// simPool models one follower's fixed worker pool as built by Raft.Make:
-// `workers` goroutines draining a FIFO of capacity `cap`.
-type simPool struct {
-	epoch   int // the owning node's epoch; a crash invalidates the pool
-	workers int
-	cap     int
-	busy    int
-	queue   []simJob
-	gen     uint64 // newest generation submitted (AppendEntries pools only)
-}
-
-type simJob struct {
-	gen uint64
-	run func(done func()) // starts the RPC; done must be called when the worker is free again
-}
-
-func (s *detSim) newPools(i int) {
-	for p := 0; p < s.n; p++ {
-		s.pools[i][p] = &simPool{epoch: s.epoch[i], workers: max(AppendWorkers, 1), cap: max(AppendQueueSize, 1)}
-		s.vpools[i][p] = &simPool{epoch: s.epoch[i], workers: 1, cap: 2}
-	}
-}
-
-// submit hands a job to a pool like Raft.sendAppend/sendVote: start it at once if
-// a worker is idle, else queue it, else (queue full) drop it via onFull.
-func (s *detSim) submit(node int, p *simPool, job simJob, onFull func()) {
-	if p.busy < p.workers {
-		p.busy++
-		s.startJob(node, p, job)
+// send models the network for one message, like a stream write at the sender: an
+// unreachable peer is an error reported back to the sender (like a broken
+// connection); random loss is silent; the rest of the faults are duplication and
+// random delay, which also reorders. The destination handles the message when
+// it arrives, if it is still reachable and running.
+func (s *detSim) send(from int, m Message) {
+	to := m.To
+	if !s.reach(from, to) {
+		s.reportUnreachable(from, to)
 		return
 	}
-	if len(p.queue) < p.cap {
-		p.queue = append(p.queue, job)
-		s.queued++
+	if s.rng.Float64() < s.drop {
 		return
 	}
-	s.full++
-	onFull()
-}
-
-func (s *detSim) startJob(node int, p *simPool, job simJob) {
-	freed := false
-	job.run(func() {
-		if freed {
-			return
-		}
-		freed = true
-		s.workerFree(node, p)
-	})
-}
-
-// workerFree is a worker finishing a call: it takes the next queued job, skipping
-// jobs made before a pipeline reset (the core has forgotten them).
-func (s *detSim) workerFree(node int, p *simPool) {
-	p.busy--
-	for len(p.queue) > 0 {
-		if s.epoch[node] != p.epoch || !s.up[node] {
-			p.queue = nil // the node crashed: its goroutines and queue are gone
-			return
-		}
-		j := p.queue[0]
-		p.queue = p.queue[1:]
-		if j.gen != 0 && j.gen < p.gen {
-			s.skipped++
-			continue
-		}
-		p.busy++
-		s.startJob(node, p, j)
-		return
+	copies := 1
+	if s.rng.Float64() < s.dup {
+		copies = 2
 	}
-}
-
-// rpc models one request/reply exchange, starting now (when a worker begins the
-// call). handle runs on the destination when the request arrives and returns the
-// continuation to run on the source when the reply arrives. Requests may be lost,
-// delayed, reordered or duplicated; so may replies. Like the real worker, the call
-// gives up RPCTimeout after it started: a later reply is discarded (the
-// destination may still have processed the request). At that point onLost (if any)
-// fires, mirroring the loss event; done (if any) frees the worker, either on the
-// reply or at the timeout, whichever comes first.
-func (s *detSim) rpc(from, to int, name string, handle func(dst *core) func(src *core), onLost func(src *core), done func(), canDup bool) {
-	fromEpoch := s.epoch[from]
-	deadline := s.now + RPCTimeout
-	finished := false
-	finish := func(lost bool) {
-		if finished {
-			return
-		}
-		finished = true
-		if lost && onLost != nil && s.epoch[from] == fromEpoch && s.up[from] {
-			onLost(s.nodes[from])
-			s.flush(from)
-		}
-		if done != nil {
-			done()
-		}
-	}
-	if onLost != nil || done != nil {
-		s.after(RPCTimeout, fmt.Sprintf("%s timeout %d->%d", name, from, to), func() { finish(true) })
-	}
-	if !s.reach(from, to) || s.rng.Float64() < s.drop {
-		return
-	}
-	if canDup && s.rng.Float64() < s.dup {
-		s.rpc(from, to, name, handle, nil, nil, false) // a second copy of the same request
-	}
-	s.after(s.delay(), fmt.Sprintf("%s req %d->%d", name, from, to), func() {
-		if !s.reach(from, to) {
-			return
-		}
-		onReply := handle(s.nodes[to])
-		if !s.flush(to) {
-			return // crashed at a persistence boundary: the reply never left
-		}
-		if s.rng.Float64() < s.drop {
-			return
-		}
-		deliverReply := func() {
-			if s.now > deadline || s.epoch[from] != fromEpoch || !s.reach(to, from) {
-				return // caller already gave up, or crashed, or unreachable
+	for k := 0; k < copies; k++ {
+		s.after(s.delay(), fmt.Sprintf("%s %d->%d", m.Type, from, to), func() {
+			if !s.arrives(from, to) {
+				return
 			}
-			onReply(s.nodes[from])
-			s.flush(from)
-			finish(false)
+			s.nodes[to].step(m)
+			s.flush(to)
+		})
+	}
+}
+
+// reportUnreachable tells the sender, asynchronously, that from->to is broken
+// (at most one report pending per pair, as in SimNet).
+func (s *detSim) reportUnreachable(from, to int) {
+	if s.unreachPending[from][to] {
+		return
+	}
+	s.unreachPending[from][to] = true
+	ep := s.epoch[from]
+	s.after(0, fmt.Sprintf("unreachable %d->%d", from, to), func() {
+		s.unreachPending[from][to] = false
+		if s.epoch[from] != ep || !s.up[from] {
+			return
 		}
-		if canDup && s.rng.Float64() < s.dup {
-			s.after(s.delay(), fmt.Sprintf("%s rep(dup) %d->%d", name, to, from), deliverReply)
-		}
-		s.after(s.delay(), fmt.Sprintf("%s rep %d->%d", name, to, from), deliverReply)
+		s.nodes[from].onUnreachable(to)
+		s.unreachables++
+		s.flush(from)
 	})
 }
 
@@ -323,17 +251,12 @@ func (s *detSim) rpc(from, to int, name string, handle func(dst *core) func(src 
 // then lost, exactly like a real process death).
 func (s *detSim) flush(i int) bool {
 	c := s.nodes[i]
-	if c.gen != nil { // publish the newest generations to the pools, as Raft.flush does
-		for p := range s.pools[i] {
-			s.pools[i][p].gen = c.gen[p]
-		}
-	}
 	rd := c.takeReady()
 	if rd.empty() {
 		return true
 	}
 	if s.crashAt(i, "before persist") {
-		return false // nothing durable, nothing sent, no reply
+		return false // nothing durable, nothing sent
 	}
 	if len(rd.Persist) > 0 {
 		if err := s.stores[i].Append(rd.Persist); err != nil {
@@ -341,29 +264,10 @@ func (s *detSim) flush(i int) bool {
 		}
 	}
 	if s.crashAt(i, "after persist, before send") {
-		return false // durable, but requests/replies/apply never left
+		return false // durable, but messages/apply never left
 	}
-	for _, v := range rd.Votes {
-		v := v
-		s.submit(i, s.vpools[i][v.peer], simJob{run: func(done func()) {
-			s.rpc(i, v.peer, "vote", func(dst *core) func(*core) {
-				reply := &RequestVoteReply{}
-				dst.handleRequestVote(v.args, reply)
-				return func(src *core) { src.onVoteReply(v.peer, v.args.Term, reply) }
-			}, nil, done, true)
-		}}, func() { /* queue full: vote request dropped */ })
-	}
-	for _, a := range rd.Appends {
-		a := a
-		s.sentAt[sentKey{i, s.epoch[i], a.seq}] = s.now
-		p := s.pools[i][a.peer]
-		s.submit(i, p, simJob{gen: a.gen, run: func(done func()) {
-			s.rpc(i, a.peer, "append", func(dst *core) func(*core) {
-				reply := &AppendEntriesReply{}
-				dst.handleAppendEntries(a.args, reply)
-				return func(src *core) { src.onAppendReply(a.peer, a.seq, a.args, reply) }
-			}, func(src *core) { src.onAppendLost(a.peer, a.seq) }, done, true)
-		}}, func() { c.onAppendLost(a.peer, a.seq) })
+	for _, m := range rd.Messages {
+		s.send(i, m)
 	}
 	s.onApply(i, rd.Apply)
 	return true
@@ -533,10 +437,10 @@ func (s *detSim) checkLight() {
 			s.fail("node %d commitIndex went back %d -> %d", i, s.seenCommit[i], r.commitIndex)
 		}
 		if r.state == Leader {
-			// Pipelining invariants. Every outstanding request is freed by its reply or
-			// by the timeout event, so none may outlive RPCTimeout (else that follower
-			// would be starved of heartbeats); the window is never exceeded and a
-			// probing follower has at most one request out; nextIndex stays sane.
+			// Pipelining invariants. A request unanswered for AppendTimeout is reset by
+			// the leader's tick, so none may outlive it by more than a tick or two (else
+			// that follower would be starved of heartbeats); the window is never exceeded
+			// and a probing follower has at most one request out; nextIndex stays sane.
 			for p := 0; p < s.n; p++ {
 				if p == i {
 					continue
@@ -544,15 +448,15 @@ func (s *detSim) checkLight() {
 				if len(r.pending[p]) > r.window || (r.probing[p] && len(r.pending[p]) > 1) {
 					s.fail("WINDOW: leader %d has %d requests to %d in flight (probing=%v, window %d)", i, len(r.pending[p]), p, r.probing[p], r.window)
 				}
+				if len(r.pending[p]) > s.maxPipe {
+					s.maxPipe = len(r.pending[p])
+				}
 				if r.nextIndex[p] <= r.matchIndex[p] || r.nextIndex[p] > len(r.log) {
 					s.fail("PROGRESS: leader %d peer %d nextIndex=%d matchIndex=%d logLen=%d", i, p, r.nextIndex[p], r.matchIndex[p], len(r.log))
 				}
-				for _, seq := range r.pending[p] {
-					// A request waits at most ceil(window/workers) timeout-rounds for a worker, plus
-					// one for stale in-progress calls from before a reset, then runs <= RPCTimeout.
-					bound := time.Duration((r.window+max(AppendWorkers, 1)-1)/max(AppendWorkers, 1)+1) * RPCTimeout
-					if at, ok := s.sentAt[sentKey{i, s.epoch[i], seq}]; ok && s.now-at > bound {
-						s.fail("STUCK SLOT: leader %d has had request %d to %d in flight for %v (> %v)", i, seq, p, s.now-at, bound)
+				if len(r.pending[p]) > 0 {
+					if age := s.base.Add(s.now).Sub(r.pending[p][0].at); age > AppendTimeout+2*tickInterval {
+						s.fail("STUCK REQUEST: leader %d has had request %d to %d unanswered for %v (> AppendTimeout %v)", i, r.pending[p][0].seq, p, age, AppendTimeout)
 					}
 				}
 			}
@@ -646,23 +550,19 @@ type simResult struct {
 	finalIndex int
 	events     int
 	rejected   int
-	pool       [3]int // queued, full, skipped
+	cov        [3]int // unreachable reports, timeout resets, deepest pipeline
 }
 
 func runSim(seed int64, dump bool) simResult {
 	// A small limit so the backpressure path is exercised (e.g. by a leader cut off in a minority).
-	defer func(u, w, b, k, q int) {
-		MaxUncommittedEntries, MaxInflightAppends, MaxAppendEntries, AppendWorkers, AppendQueueSize = u, w, b, k, q
-	}(MaxUncommittedEntries, MaxInflightAppends, MaxAppendEntries, AppendWorkers, AppendQueueSize)
+	defer func(u, w, b int) {
+		MaxUncommittedEntries, MaxInflightAppends, MaxAppendEntries = u, w, b
+	}(MaxUncommittedEntries, MaxInflightAppends, MaxAppendEntries)
 	MaxUncommittedEntries = 20
 	// Vary the pipeline per seed so window 1 (no pipelining), small windows and
 	// small/large batches are all exercised.
 	MaxInflightAppends = 1 + int(seed%6)
 	MaxAppendEntries = []int{2, 8, 128}[(seed/6)%3]
-	// Fewer workers and a small queue than the window force queueing, queue-full
-	// drops and stale-job skipping.
-	AppendWorkers = []int{1, 2, 4}[(seed/18)%3]
-	AppendQueueSize = []int{2, 8, 64}[(seed/54)%3]
 	s := newDetSim(seed, dump)
 	s.drop, s.dup, s.maxDelay, s.longRate, s.longDelay = 0.15, 0.05, 20*time.Millisecond, 0.05, 500*time.Millisecond
 	s.crashRate = 0.006
@@ -681,7 +581,7 @@ func runSim(seed int64, dump bool) simResult {
 			fmt.Fprintf(s.h, "node %d term=%d vote=%d state=%d commit=%d log=%v\n", i, r.currentTerm, r.votedFor, r.state, r.commitIndex, r.log)
 		}
 	}
-	res := simResult{hash: s.h.Sum64(), failures: s.failures, recent: s.recent, trace: s.trace, events: s.events, rejected: s.rejected, pool: [3]int{s.queued, s.full, s.skipped}}
+	res := simResult{hash: s.h.Sum64(), failures: s.failures, recent: s.recent, trace: s.trace, events: s.events, rejected: s.rejected, cov: [3]int{s.unreachables, s.timeouts, s.maxPipe}}
 	if len(s.committed) > 0 {
 		res.finalIndex = len(s.committed) - 1
 	}
@@ -739,7 +639,7 @@ func TestDeterministicReplay(t *testing.T) {
 	}
 	hashes := map[uint64]int64{}
 	totalRejected := 0
-	var totalPool [3]int
+	var totalCov [3]int
 	for _, seed := range seeds {
 		seed := seed
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
@@ -756,9 +656,9 @@ func TestDeterministicReplay(t *testing.T) {
 				t.Fatalf("NOT DETERMINISTIC: seed %d hash %x (%d events) vs %x (%d events)", seed, a.hash, a.events, b.hash, b.events)
 			}
 			totalRejected += a.rejected
-			for k := range totalPool {
-				totalPool[k] += a.pool[k]
-			}
+			totalCov[0] += a.cov[0]
+			totalCov[1] += a.cov[1]
+			totalCov[2] = max(totalCov[2], a.cov[2])
 			t.Logf("events=%d finalCommitIndex=%d rejected=%d hash=%x", a.events, a.finalIndex, a.rejected, a.hash)
 			if other, dup := hashes[a.hash]; dup {
 				t.Errorf("seeds %d and %d produced the same trace hash; hash is not sensitive", other, seed)
@@ -767,11 +667,15 @@ func TestDeterministicReplay(t *testing.T) {
 		})
 	}
 	if len(seeds) >= 20 && !t.Failed() {
-		t.Logf("worker-pool coverage over %d seeds: queued=%d dropped-on-full=%d skipped-stale=%d", len(seeds), totalPool[0], totalPool[1], totalPool[2])
-		for k, name := range []string{"queued", "dropped-on-full", "skipped-stale"} {
-			if totalPool[k] == 0 {
-				t.Errorf("worker-pool path %q was never exercised", name)
-			}
+		t.Logf("coverage over %d seeds: unreachable-reports=%d timeout-resets=%d deepest-pipeline=%d", len(seeds), totalCov[0], totalCov[1], totalCov[2])
+		if totalCov[0] == 0 {
+			t.Error("the unreachable path was never exercised")
+		}
+		if totalCov[1] == 0 {
+			t.Error("the append-timeout path was never exercised")
+		}
+		if totalCov[2] < 2 {
+			t.Error("pipelining (more than one request in flight) was never exercised")
 		}
 	}
 	if len(seeds) >= 20 && totalRejected == 0 && !t.Failed() {

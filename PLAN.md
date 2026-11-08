@@ -10,11 +10,11 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
 
 | 文件 | 内容 |
 |---|---|
-| `raft/types.go` | 状态枚举、`LogEntry`、`ApplyMsg`、RPC 参数/应答、`Transport` 接口 |
+| `raft/types.go` | 状态枚举、`LogEntry`、`ApplyMsg`、`Message`（四种消息）、`Transport`（异步 `Send`）与 `Endpoint`（`Step`/`ReportUnreachable`）接口 |
 | `raft/core.go` | **纯状态机 `core`**：选举、日志复制、commit 推进；不做任何 IO，输出累积在 `Ready` 里 |
 | `raft/raft.go` | **IO 外壳 `Raft`**：事件循环、`flush`（先落盘再发送/回复/apply）、applyPump、对外 API |
 | `raft/wal.go` | `Storage` 接口、`MemStorage`、`FileWAL`（追加写 + fsync + CRC） |
-| `raft/simnet.go` | 进程内模拟网络：丢包、延迟、分区、节点宕机 |
+| `raft/simnet.go` | 进程内模拟网络（异步消息）：丢包、重复、延迟乱序、分区、宕机、发送队列上限；单个调度协程 |
 | `raft/*_test.go` | 选举/复制/分区/持久化/混沌测试、WAL 单测 |
 
 ## 阶段
@@ -27,7 +27,7 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
   ④ 状态机本身不写盘（见阶段 8）：写盘由外壳在每个事件处理后统一完成。
 - [x] **2. 选举引擎**：后台 ticker 驱动；随机选举超时 150–300ms；心跳 50ms；
   当选 Leader 后追加一条 no-op 日志，以便提交前任期遗留的日志。
-- [x] **3. RPC 层**：`RequestVote` / `AppendEntries`，严格 term 校验、prevLog 一致性检查，
+- [x] **3. 消息层**（最初是 RPC，阶段 14 起改为异步消息 `MsgVote`/`MsgVoteResp`/`MsgApp`/`MsgAppResp`，校验逻辑不变）：严格 term 校验、prevLog 一致性检查，
   冲突时返回 `ConflictIndex/ConflictTerm` 让 Leader 快速回退 `nextIndex`；
   只在**真正冲突**时截断日志（避免乱序/重复 RPC 误删已匹配日志）。
 - [x] **4. WAL 持久化**：追加记录 `meta(term,votedFor)` 与 `append(index, entries)`，
@@ -76,7 +76,7 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
     重启后又投给同任期的另一候选人且两人都凑够多数，组合太稀有，属于已知检测盲区。
     教训：写变异时要确认它真的改变了行为（本阶段有两个变异因模拟器的可达性/返回值逻辑而是空操作）。
 
-- [x] **9. 限制在途协程数量（RPC 超时 + 每个 follower 至多一个在途 AppendEntries）**：
+- [x] **9. 限制在途协程数量（RPC 超时 + 每个 follower 至多一个在途 AppendEntries）**〔其中的 RPC 超时、`context`、协程上界已被阶段 14 取代：超时改由核心在 tick 里按 `AppendTimeout` 判定，节点不再为请求起协程；在途窗口的思路保留〕：
   - 问题：此前每次广播都起新协程，对端卡住时数量无上限。
   - `Transport` 方法增加 `context.Context` 参数；外壳用 `RPCTimeout`（默认 80ms）为每个 RPC 设超时，
     超时即视为丢失。Transport 实现必须遵守 ctx（SimNet 已遵守）。
@@ -129,7 +129,7 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
     窗口 8 用 0.28s，约 6.9 倍。变异验证：发送时乐观推进 `matchIndex`（未确认就算已复制）300 个种子中 205 个失败
     （含"已提交条目丢失"）；窗口不设上限 240 个失败。
 
-- [x] **12. 固定 worker 协程（取代"每个请求一个协程"，对应 etcd rafthttp 的 pipeline：每 peer 固定 4 个 worker + 缓冲队列）**：
+- [x] **12. 固定 worker 协程**〔已被阶段 14 取代：worker 池、队列整体删除，发送由传输层负责〕（取代"每个请求一个协程"，对应 etcd rafthttp 的 pipeline：每 peer 固定 4 个 worker + 缓冲队列）**：
   - 问题：此前每个 RPC 起一个临时协程，协程数随负载浮动；窗口调大后上界 `(n-1)×窗口` 也随之变大。
   - `Make` 时为每个 follower 一次性启动：`窗口` 个 AppendEntries worker + 1 个投票 worker，之后协程数与负载无关。
     发送只是把任务放进该 peer 的有缓冲 channel；worker 取任务、调用 `Transport`、再把结果作为事件投回事件循环。
@@ -144,7 +144,7 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
     模拟器 2000 个种子、`go test -race` 全部通过。
   - 代价：常驻协程增加（n=5、窗口 4 时每节点 22 个，空闲时也在），换取与负载无关的确定上界。
 
-- [x] **13. 与 etcd 对齐：worker 数 < 队列容量 < 窗口上限（取代阶段 12 的"窗口 = worker 数"）**：
+- [x] **13. 与 etcd 对齐：worker 数 < 队列容量 < 窗口上限**〔已被阶段 14 取代：worker、队列、代数跳过随外壳一起删除；`MaxInflightAppends` 窗口保留，`AppendWorkers`/`AppendQueueSize` 删除〕（取代阶段 12 的"窗口 = worker 数"）：
   - etcd rafthttp pipeline：固定 4 个 worker 从带缓冲（64）的队列取消息；**超时从 worker 开始调用时算起**（入队时不计时）；
     调用失败 → `ReportUnreachable`（raft 退回探测）并继续取下一条；队列满 → 丢弃并 `ReportUnreachable`。
   - 三个独立参数：`AppendWorkers`（默认 4，决定常驻协程）、`AppendQueueSize`（默认 64，对应 `pipelineBufSize`）、
@@ -174,6 +174,45 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
     pipeline 只是降级通道和快照通道；本项目的 `Transport` 是请求/应答式 RPC，worker 池对应 etcd 的 pipeline，
     不改造为流式异步消息。
 
+- [x] **14. 请求/应答式 Transport 改为流式异步消息（对应 etcd 的 stream：消息单向发送，应答是反向的独立消息）**：
+  - **消息**：`Message{Type, From, To, Term, ...}`，四种类型：`MsgVote`、`MsgVoteResp`、`MsgApp`（带 `Seq`、`PrevLogIndex/Term`、
+    `Entries`、`LeaderCommit`）、`MsgAppResp`（回显 `Seq`，成功时带 `Match`，失败时带 `ConflictIndex/Term`）。
+    应答不再依赖"原请求参数"：`Match` 由 follower 算好随应答带回，leader 只用 `Seq` 在 `pending` 里找到发送时间和 `prev`。
+  - **接口**：`Transport.Send(Message)` 非阻塞、尽力而为（可静默丢弃，必须有界）；传输层把入站消息交给 `Endpoint.Step(Message)`，
+    并在连接断开时调用 `Endpoint.ReportUnreachable(peer)`（对应 etcd 的 `ReportUnreachable`，核心据此立即退回探测）。
+    `*Raft` 实现 `Endpoint`。删除 `RequestVote`/`AppendEntries` RPC 入口与 `Handler` 接口。
+  - **核心**：`step(Message)` 统一入口；输出改为 `Ready.Messages`（含应答）。因此"先持久化再对外可见"对应答也自动成立——
+    应答就是 `Ready` 里的一条消息，在落盘之后才与其他消息一起发出；外壳里"放行等待中的 RPC 调用方"的 `release` 只保留给
+    `Propose`/`State`。
+  - **超时挪进核心**：不再有 `context`/`RPCTimeout`。核心在每次 tick 检查每个 follower 最旧的在途 `MsgApp`，
+    超过 `AppendTimeout`（默认 80ms，即原 `RPCTimeout`）视为丢失 → 退回探测（与之前"丢失事件"同一处理）。
+    约束改为 `AppendTimeout + tickInterval + HeartbeatInterval < ElectionTimeoutMin`。
+    投票请求不需要超时（候选人本来就靠选举超时重试）。
+  - **窗口保留**：`MaxInflightAppends`（默认 32）仍是核心的流控（对应 etcd 的 `MaxInflightMsgs`），探测/复制状态机、乐观
+    `nextIndex`、`matchIndex` 只由成功应答推进、心跳锚定 `matchIndex` 全部不变。
+  - **节点协程**：只剩 `run()` 与 `applyPump` 两个，**不为任何消息起协程**；发送、排队、收发协程全部属于传输层。
+    删除 worker 池、队列、代数跳过（阶段 12、13 的外壳机制）及 `AppendWorkers`/`AppendQueueSize`。
+    后果：重置后传输层里可能还有旧的 `MsgApp` 在途，到达后按 `Seq` 查不到、被当作过期应答（成功的仍可单调推进 `Match`），
+    无害；"新探测排在旧消息后面"的队头阻塞属于传输层问题（etcd 同样如此）。
+  - **参考传输 `SimNet`**：单个调度协程 + 按送达时间排序的堆；`Send` 在发送端立即判定：目标不可达 → 异步通知发送方
+    `ReportUnreachable`（对应流写失败）；随机丢包 → 静默丢弃；按概率重复；随机延迟（造成乱序）；每个 (from,to)
+    在途消息数有上限，超过则丢弃并报不可达（对应 etcd 的 `streamBufSize` 满）。`Send` 不阻塞、不起协程。
+  - **模拟器**：同一套故障模型作用于消息（丢失/重复/乱序/分区/宕机/落盘边界崩溃），分区或宕机时对发送方触发
+    `onUnreachable`；删除 worker 池/队列建模。`STUCK SLOT` 不变量改为：leader 最旧的在途 `MsgApp` 年龄 ≤ `AppendTimeout` + 一个 tick。
+  - **测试**：外壳测试改用"假对端"（按消息脚本化应答，可带延迟）；新增 `TestNodeStartsFixedGoroutines`
+    （节点只多出 2 个协程，且不随提案数、选举次数增长）与 `TestUnansweredAppendsBounded`（对端永不应答时，
+    同一 follower 的两次 `MsgApp` 至少间隔 `AppendTimeout`，且持续重试）；吞吐、限流、基础集群与混沌测试保留。
+  - **验证结果**：模拟器 2000 个种子、`go test -race` 全部通过；覆盖统计（300 种子）：不可达通知约 16.6 万次、
+    超时重置约 2.2 万次、流水线最深 6 个请求，三条路径都被要求触发过。外壳测试：节点恰好只多出 2 个协程，
+    且 2000 条提案、对端永不应答时仍是 2 个；窗口 1/8/32 在 RTT 30ms 下提交 600 条用时 1.87s/0.28s/0.09s
+    （6.7×/19.9×；不再受 worker 数限制）。
+    变异验证：核心不再判定超时 → 模拟器 300/300 种子失败（`STUCK REQUEST`），外壳测试也失败；follower 在应答里谎称整条日志
+    都匹配 → 31 个种子失败（含"已提交条目丢失"）；先发送后落盘 → 1000 个种子中 16 个失败（含"已提交条目丢失"）。
+  - **模型修正（本阶段发现）**：模拟器与 `SimNet` 原先在送达时要求**发送方仍在运行**，等于"发送方一崩溃，它已发出的消息就消失"，
+    这使"先发后存"这类错误无处暴露（上一轮的同类变异也因此没被抓到）。改为送达只要求接收方在运行且未被分区，
+    之后"先发后存"的变异才被检出。
+  - **仍然没做**：etcd 的 msgApp 流还会把多条消息合并发送、按流做压缩编码，真实网络（TCP 流、断线重连）适配器也未实现。
+
 ## 与原指南的有意偏差（原因）
 
 1. **Ticker 用 10ms 轮询 + deadline，而不是 `time.Timer` 通道**：`Timer.Reset` 需要先 drain 通道，
@@ -182,8 +221,8 @@ apply 通道，以及带故障注入的模拟网络与测试。模块名 `github
    收到合法 Leader 的 AppendEntries、投出选票、发起新选举、Leader 因应答中的更高 term 而退位时重置。
 3. **并发模型改为事件循环（原指南为大锁）**：按用户要求；Raft 核心不再有 `sync.Mutex`，`Kill()` 通过关闭
    `done` 并等待循环退出来保证之后不再写盘。Applier 用 pump 协程而不是 `Sleep(10ms)` 轮询。
-4. **传输层抽象为 `Transport` 接口（带类型的两个方法），不直接依赖 `net/rpc`**：
-   便于模拟网络注入故障；`net/rpc` 适配器列为后续工作，不在本次范围。
+4. **传输层抽象为 `Transport` 接口，不直接依赖 `net/rpc`**：便于模拟网络注入故障。阶段 14 起它是异步消息接口
+   （`Send(Message)` 非阻塞、`Endpoint.Step` 入站），而不是请求/应答式 RPC；真实网络适配器仍列为后续工作。
 5. **`Command` 仍为 `interface{}`**：WAL 用 gob，自定义类型需 `gob.Register`；
    `Command == nil` 保留给 Leader no-op，不能用作业务命令。
 6. **模拟网络延迟按比例缩小**：指南的 0–2s 延迟远大于 150ms 选举超时，会使集群长期无主；
